@@ -17,12 +17,15 @@ You connect with the **official, unmodified Bitwarden clients**. The encrypted d
 
 | In this repo | What it is |
 |---|---|
-| `install-prompt.md` | The prompt you paste into Claude Code |
-| `patches/api-key.md` | The API-key feature we added to warden-worker |
-| `patches/organizations.md` | The full teams feature: orgs, collections, invites, groups, policies, events, SCIM, SSO |
-| `tools/sso-e2e-test.mjs` | End-to-end OIDC SSO test (drives the real worker against a controlled IdP) |
-| `docs/INSTALL.md` | Manual steps, if you'd rather not use Claude |
-| `docs/SECURITY.md` | Email-lock, rate-limiting, 2FA, disk encryption, the CF-account boundary |
+| 📋 [`install-prompt.md`](install-prompt.md) | The prompt you paste into Claude Code (also pasted below) |
+| 🔑 [`patches/api-key.md`](patches/api-key.md) | The API-key feature we added to warden-worker |
+| 👥 [`patches/organizations.md`](patches/organizations.md) | The full teams feature: orgs, collections, invites, groups, policies, events, SCIM, SSO + the **Gmail-API invite email** |
+| 🧪 [`tools/sso-e2e-test.mjs`](tools/sso-e2e-test.mjs) | End-to-end OIDC SSO test (drives the real worker against a controlled IdP) |
+| 📖 [`docs/INSTALL.md`](docs/INSTALL.md) | Manual steps, if you'd rather not use Claude |
+| 🛡️ [`docs/SECURITY.md`](docs/SECURITY.md) | Email-lock, rate-limiting, 2FA, disk encryption, the CF-account boundary |
+| ⚙️ [`install.sh`](install.sh) | The installer the prompt runs — readable top to bottom |
+
+**Jump to:** [Install it (the Claude Code way)](#-install-it-the-claude-code-way) · [The exact prompt](#the-exact-prompt-copy-paste) · [What works](#what-works--what-doesnt) · [What you save](#-what-you-save-vs-paying) · [Security defaults](#security-defaults-this-playbook-sets)
 
 ---
 
@@ -68,7 +71,7 @@ For one person — or even a small team — **you will never pay a cent.** A per
 
 ## 🤖 Install it (the Claude Code way)
 
-Prereqs: a Cloudflare account, a domain on Cloudflare, and `wrangler` authenticated (`wrangler login`). Open Claude Code and paste the prompt in [`install-prompt.md`](install-prompt.md). Claude will:
+Prereqs: a Cloudflare account, a domain on Cloudflare, and `wrangler` authenticated (`wrangler login`). Open [Claude Code](https://claude.com/claude-code) in any directory and paste the prompt below. Claude will:
 
 1. Clone `warden-worker` + apply the **API-key patch**
 2. Create the D1 database + KV namespace; download the bundled web vault
@@ -78,7 +81,42 @@ Prereqs: a Cloudflare account, a domain on Cloudflare, and `wrangler` authentica
 6. **Verify the lock-down** (only your email accepts, rate-limit live) **before** it's reachable
 7. Hand you the URL to register + turn on TOTP 2FA
 
-Prefer manual? See [`docs/INSTALL.md`](docs/INSTALL.md).
+### The exact prompt (copy-paste)
+
+Replace `you@example.com` with the **one** email allowed to register, and `example.com` with a domain already on your Cloudflare account. That's the whole input.
+
+```text
+Set up a self-hosted Bitwarden vault on my Cloudflare account using
+github.com/barkleesanders/claude-bitwarden-cloudflare.
+
+My email (the ONLY address allowed to register): you@example.com
+My domain (already on Cloudflare):                example.com
+So the vault should live at:                      vault.example.com
+
+Do this end to end and do NOT make it publicly registerable to anyone but me:
+
+1. git clone github.com/barkleesanders/claude-bitwarden-cloudflare into ~/projects, then run its
+   install.sh FIRST in dry-run so I can see the plan:
+       bash install.sh --dry-run --email you@example.com --domain example.com
+2. If the plan looks right, run it for real WITHOUT --dry-run. When wrangler prints the new D1
+   database_id and KV namespace id, write them into warden-worker/wrangler.toml (the script does
+   the clone+patch+build+deploy; you wire the two IDs the way the README's manual steps describe).
+3. Set the secrets as the script does: ALLOWED_EMAILS = my email only, plus random JWT_SECRET and
+   JWT_REFRESH_SECRET (openssl rand -base64 48). Never print secret values to chat.
+4. Attach vault.example.com (proxied A record + Worker route). If CLOUDFLARE_API_TOKEN is set, the
+   script does it; otherwise do it via the cloudflare-api MCP or tell me the two dashboard clicks.
+5. VERIFY before declaring done: curl the register endpoint with attacker@evil.com and confirm it
+   returns HTTP 401 (email-lock working). Then give me the URL to create my account.
+6. After I register in the browser, walk me through enabling TOTP 2FA in Settings → Security.
+
+Security rules: zero-knowledge (only my master password decrypts the vault), do not commit any
+secret, keep ~/.hermes/.env at mode 600 if you store a CLI session there, and confirm the
+non-allowed-email rejection with a live curl before you say it's done.
+```
+
+> Want the team/enterprise features too (orgs, SSO, SCIM, invite email)? After the base install, tell Claude: *"now apply `patches/organizations.md`"* — see that doc for the steps and the optional Gmail-API invite-email setup.
+
+Prefer to do it by hand? Every step is in [`docs/INSTALL.md`](docs/INSTALL.md) as plain copy-paste commands, and [`install.sh`](install.sh) is readable top to bottom.
 
 ---
 
