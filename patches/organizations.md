@@ -22,8 +22,16 @@ cp ../claude-bitwarden-cloudflare/patches/0016_add_org_enterprise.sql migrations
 ```
 
 Verified end-to-end: applied to a **fresh clone + api-key.patch**, it `cargo check`s and builds
-with `worker-build --release` from scratch (0 errors, 0 clippy warnings). ~3,800 insertions across
-15 files.
+with `worker-build --release` from scratch (0 errors, 0 clippy warnings). ~4,400 insertions across
+17 files.
+
+> **⚠️ Required `wrangler.toml` change (or `/sso/*` and `/scim/*` will 404 in production).**
+> warden-worker serves non-API paths as static assets. The new SSO + SCIM routes live outside
+> `/api/*`, so you must add them to `run_worker_first`:
+> ```toml
+> run_worker_first = ["/api/*", "/identity/*", "/notifications/*", "/sso/*", "/scim/*"]
+> ```
+> (This was caught by the end-to-end test below — a unit test wouldn't have.)
 
 ## What it adds (full working flow)
 
@@ -108,25 +116,31 @@ These go beyond "orgs + shared collections" — added on request, all compiling:
 - **SSO (OIDC)** — config storage + management (`…/organizations/{id}/sso`) and an
   authorize/callback OIDC flow.
 
-### SSO is now built end-to-end (to spec) — one honest verification caveat
+### SSO — built and **tested end-to-end** (one remaining caveat)
 
-The full OIDC login flow is implemented:
+The full OIDC login flow is implemented and **verified working end-to-end** by an automated test
+(`tools/sso-e2e-test.mjs`) that runs the real worker under `wrangler dev` against a controlled OIDC
+IdP and drives the whole chain:
 
-1. `prevalidate` → `authorize` redirects to the IdP, carrying the web vault's `state` /
-   `redirectUri` / `codeChallenge` through the round-trip.
+1. `authorize` redirects to the IdP, carrying the web vault's `state` / `redirectUri` /
+   `codeChallenge` through the round-trip.
 2. `callback` runs OIDC **discovery**, fetches the IdP **JWKS**, and **verifies the id_token's RS256
    signature (WebCrypto) + iss/aud/exp/nonce** — real authentication, not a decode.
 3. It links the IdP subject to a vault account, mints a **one-time Bitwarden SSO authorization code**,
    and redirects back to the web vault.
-4. `/identity/connect/token` has an **`authorization_code` grant** (with **PKCE S256**) that redeems
-   the code and issues real warden access/refresh tokens via the same path as password login.
+4. `/identity/connect/token`'s **`authorization_code` grant** (with **PKCE S256**) redeems the code
+   and issues a real warden access token.
 
-**The one caveat:** this follows the documented Bitwarden SSO-connector contract but has **not been
-verified against a live official web vault** (that handshake is version-coupled — exact prevalidate
-token shape, connector redirect URLs, PKCE params). It compiles and is spec-correct; confirm it
-against your web vault before relying on it. Also note: even working SSO does **not** give
-password-less unlock — the vault is end-to-end encrypted, so you still enter your master password to
-decrypt (password-less needs Key Connector / TDE, separate large subsystems, not included).
+The test passes: `authorize → IdP → callback (JWKS RS256 verify + link) → SSO code → token`. It also
+caught three real bugs during development (the `run_worker_first` routing gap above, a JWK-as-JS-Map
+WebCrypto rejection, and an identifier-conflict 500) — all fixed.
+
+**The remaining caveat:** the controlled IdP exercises the exact OIDC contract, but this has **not
+been driven by the *official Bitwarden web-vault* SSO UI** (its prevalidate/connector redirect
+specifics are version-coupled) nor against a specific commercial IdP — confirm against yours before
+relying on it. And SSO does **not** give password-less unlock: the vault is end-to-end encrypted, so
+you still enter your master password to decrypt (password-less needs Key Connector / TDE — not
+included). Run the test yourself: `node tools/sso-e2e-test.mjs` with `wrangler dev` running locally.
 
 ## Still not included
 

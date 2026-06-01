@@ -386,10 +386,10 @@ index f8c4029..1eaeaed 100644
 +);
 +CREATE INDEX IF NOT EXISTS idx_scim_tokens_hash ON scim_tokens(token_hash);
 diff --git a/src/crypto.rs b/src/crypto.rs
-index 8882e51..14d2ffa 100644
+index 8882e51..df2a8ba 100644
 --- a/src/crypto.rs
 +++ b/src/crypto.rs
-@@ -331,3 +331,70 @@ pub fn generate_api_key() -> Result<String, AppError> {
+@@ -331,3 +331,74 @@ pub fn generate_api_key() -> Result<String, AppError> {
  pub fn ct_eq(a: &str, b: &str) -> bool {
      constant_time_eq(a.as_bytes(), b.as_bytes())
  }
@@ -428,9 +428,13 @@ index 8882e51..14d2ffa 100644
 +    )
 +    .map_err(|_| AppError::Crypto("alg hash".to_string()))?;
 +
-+    // The JWK as a JS object.
-+    let jwk_obj = worker::d1::serde_wasm_bindgen::to_value(jwk)
-+        .map_err(|e| AppError::Crypto(format!("jwk to_value: {e:?}")))?;
++    // The JWK as a plain JS object. NOTE: the default serde_wasm_bindgen conversion
++    // turns a serde_json map into a JS `Map`, which WebCrypto rejects ("kty undefined").
++    // Serialize maps as objects so importKey sees a real JWK.
++    let serializer =
++        worker::d1::serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true);
++    let jwk_obj = serde::Serialize::serialize(jwk, &serializer)
++        .map_err(|e| AppError::Crypto(format!("jwk serialize: {e:?}")))?;
 +    let jwk_obj: &js_sys::Object = jwk_obj.unchecked_ref();
 +
 +    let usages = js_sys::Array::of1(&JsValue::from_str("verify"));
