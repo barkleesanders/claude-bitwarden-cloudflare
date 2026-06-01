@@ -6,11 +6,12 @@
 
 ## What this literally is (no magic)
 
-It is **not** a new password manager. It's three concrete things:
+It is **not** a new password manager. It's four concrete things:
 
 1. **[`warden-worker`](https://github.com/qaz741wsd856/warden-worker)** — a Bitwarden-compatible server written in Rust, compiled to WASM, running on Cloudflare Workers + D1.
 2. **An API-key patch we wrote** — adds the personal API-key endpoints warden-worker is missing, so `bw login --apikey`, the `client_credentials` OAuth grant, and the web vault's *"View API key"* button actually work.
-3. **A Claude Code install prompt** — clones, patches, builds, deploys, and security-hardens it end-to-end, including the Cloudflare parts (D1, KV, secrets, DNS, routes) most people get stuck on.
+3. **An Organizations patch we wrote** (optional) — adds clean-room **teams**: Organizations, shared Collections, member invites, Groups, policies, audit log, SCIM, and OIDC SSO. The web vault Admin Console (members page + Invite dialog) works — verified live in a real browser. [`patches/organizations.md`](patches/organizations.md).
+4. **A Claude Code install prompt** — clones, patches, builds, deploys, and security-hardens it end-to-end, including the Cloudflare parts (D1, KV, secrets, DNS, routes) most people get stuck on.
 
 You connect with the **official, unmodified Bitwarden clients**. The encrypted data lives in *your* Cloudflare D1 database — only your master password decrypts it.
 
@@ -18,6 +19,8 @@ You connect with the **official, unmodified Bitwarden clients**. The encrypted d
 |---|---|
 | `install-prompt.md` | The prompt you paste into Claude Code |
 | `patches/api-key.md` | The API-key feature we added to warden-worker |
+| `patches/organizations.md` | The full teams feature: orgs, collections, invites, groups, policies, events, SCIM, SSO |
+| `tools/sso-e2e-test.mjs` | End-to-end OIDC SSO test (drives the real worker against a controlled IdP) |
 | `docs/INSTALL.md` | Manual steps, if you'd rather not use Claude |
 | `docs/SECURITY.md` | Email-lock, rate-limiting, 2FA, disk encryption, the CF-account boundary |
 
@@ -44,7 +47,7 @@ Running cost: **$0/year** (Cloudflare free tier; you already own the domain). He
 | 250 | $12,000 | $24,000 | ~$0–$60 | **$12k–24k** |
 | 1,000 | $48,000 | $96,000 | ~$60–$600 | **$47k–95k** |
 
-**Organizations + sharing:** base warden-worker is personal-vault only, but an optional **working** clean-room patch ([`patches/organizations.md`](patches/organizations.md)) adds **Organizations, shared Collections, member invites, and cipher sharing** — ACL-enforced, Cloudflare-native invites (manual-confirm, no external email), builds clean. So this **can** be a team-sharing setup, not just a personal vault — now including Groups, org policies, event-log audit, and SCIM provisioning. (SSO is a config + OIDC scaffold, not yet a full login path — honest boundary in the patch doc.) Said up front on purpose.
+**Organizations + sharing:** base warden-worker is personal-vault only, but an optional **working** clean-room patch ([`patches/organizations.md`](patches/organizations.md)) turns it into a **team** vault: Organizations, shared Collections, the Admin Console members page + **Invite-member dialog** (verified live in a real browser), cipher sharing, Groups, org policies, event-log audit, and SCIM — all ACL-enforced. Invited people **self-register** and the invite shows up in their vault for you to confirm; outbound notification email is optional (Resend-compatible). SSO (OIDC) is built and tested end-to-end against a controlled IdP. So this **can** be a team-sharing setup for a nonprofit or small org — at **$0**. Said up front on purpose.
 
 ---
 
@@ -81,7 +84,7 @@ Prefer manual? See [`docs/INSTALL.md`](docs/INSTALL.md).
 
 ## What works / what doesn't
 **Works:** logins, folders, TOTP, attachments (KV/R2), Bitwarden Send, device management, live sync/push, equivalent-domain matching, HIBP breach checks, 2FA (authenticator app), and the added **API key / `bw login --apikey`**. All official Bitwarden clients.
-**Works (optional patch):** Organizations, shared Collections, member invites + confirm, cipher sharing, **Groups, org policies, event-log audit, SCIM provisioning** — ACL-enforced, Cloudflare-native invites, optional outbound email ([details](patches/organizations.md)).
+**Teams (optional patch — [`patches/organizations.md`](patches/organizations.md)):** Organizations, shared Collections, the Admin Console **members page + Invite-member dialog** (verified working in a real browser), member confirm, cipher sharing, **Groups, org policies, event-log audit, SCIM provisioning**. ACL-enforced. **Invited emails self-register** (no manual allowlist edits) and auto-link to their pending membership on signup. Invite notification **email is optional** — point `EMAIL_PROVIDER_URL`/`EMAIL_API_KEY`/`EMAIL_FROM` at a Resend-compatible endpoint; without it, invites still work (the org appears in the invitee's vault after they register, then you confirm them).
 **SSO (OIDC):** full flow built + **tested end-to-end** (`tools/sso-e2e-test.mjs` drives the real worker: discovery + JWKS **RS256 id_token verify** → identity link → one-time SSO code → `authorization_code` grant (PKCE) issuing a real token). Caveat: tested against a controlled IdP, **not** yet the official web-vault SSO UI or a specific commercial IdP; and the E2E vault still needs your master password to decrypt (no Key Connector/TDE). Honest boundary in the patch doc.
 
 ## Security defaults this playbook sets

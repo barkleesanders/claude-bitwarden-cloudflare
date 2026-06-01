@@ -155,3 +155,29 @@ The migration only **adds** tables; existing `users`/`ciphers`/`folders`/`sends`
 returns your same vault plus your orgs/collections (empty if you have none). To go live: apply
 `0015_add_organizations.sql` to your D1 and redeploy (see the repo README's deploy section). Not
 deploying changes nothing.
+
+## Inviting real teammates (registration + optional email)
+
+For the Admin Console **Invite member** dialog to fully work, three endpoints the members page
+loads were added (they were mis-routed to wildcards before): `GET /organizations/{id}/collections/details`,
+`GET /ciphers/organization-details`, and the self-host billing metadata. Without them the org-admin
+component's data load rejects and the Invite button does nothing — fixed and verified by driving the
+live web vault over CDP.
+
+Two more pieces make invites usable by *other people*:
+
+1. **Invited emails can self-register.** The `/identity/accounts/register` endpoint now allows any
+   email that holds a pending org invite (in addition to `ALLOWED_EMAILS`), and **links the new
+   account to its pending memberships on signup**. So you don't hand-edit an allowlist per person.
+   Set `DISABLE_USER_REGISTRATION="false"` so invitees see the **Create account** button — the
+   endpoint still rejects anyone who isn't allowed-or-invited.
+
+2. **Outbound invite email is optional.** Set `EMAIL_PROVIDER_URL` (e.g. `https://api.resend.com/emails`),
+   `EMAIL_API_KEY` (a **Worker secret**, never in this repo), and `EMAIL_FROM` (a verified sender) to
+   email invitees a notification. **Without it, invites still work** — the org appears in the
+   invitee's vault on their next sync after they register, and an admin confirms them. This is the
+   "Cloudflare-native, no external service" default.
+
+**Flow without email:** invite → tell the person to open the vault and create an account → it links
+to their invite → they appear in your members list → you confirm them (their client wraps the org
+key). **Flow with email:** same, but they get a notification instead of you telling them.
