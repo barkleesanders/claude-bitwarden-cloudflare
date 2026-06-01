@@ -3971,6 +3971,18 @@ index 50f5452..2bce783 100644
          &[user_id.clone().into()],
          "",
          force_row_query,
+diff --git a/src/lib.rs b/src/lib.rs
+index 0d2aedd..c676f14 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,3 +1,7 @@
++// serde_json::json! expands recursively; the large profileOrganization object
++// (full Bitwarden capability-flag set) exceeds the default limit of 128.
++#![recursion_limit = "256"]
++
+ use std::sync::Arc;
+ 
+ use axum::{extract::DefaultBodyLimit, Extension};
 diff --git a/src/models/cipher.rs b/src/models/cipher.rs
 index 4a8b289..c0ba8ce 100644
 --- a/src/models/cipher.rs
@@ -4003,10 +4015,10 @@ index 9a36d52..f767ae2 100644
  pub mod twofactor;
 diff --git a/src/models/organization.rs b/src/models/organization.rs
 new file mode 100644
-index 0000000..e4dc09a
+index 0000000..0a69c95
 --- /dev/null
 +++ b/src/models/organization.rs
-@@ -0,0 +1,404 @@
+@@ -0,0 +1,431 @@
 +use serde::Deserialize;
 +use serde_json::{json, Value};
 +
@@ -4276,6 +4288,13 @@ index 0000000..e4dc09a
 +        "maxCollections": Value::Null,
 +        "maxStorageGb": Value::Null,
 +        "identifier": Value::Null,
++        "productTierType": 3,
++        "planProductType": 3,
++        "allowAdminAccessToAllCollectionItems": true,
++        "limitCollectionCreation": false,
++        "limitCollectionDeletion": false,
++        "useSecretsManager": false,
++        "usePasswordManager": true,
 +    })
 +}
 +
@@ -4292,6 +4311,22 @@ index 0000000..e4dc09a
 +        "enabled": true,
 +        "object": "profileOrganization",
 +        "userId": member.user_id,
++        // The membership id (distinct from userId) — the member/invite dialog dereferences this.
++        "organizationUserId": member.id,
++        // Plan tier (Enterprise) so the web vault doesn't apply Free-tier member/collection limits.
++        "productTierType": 3,
++        "planProductType": 3,
++        // Flexible Collections flags the member + collection dialogs read.
++        "allowAdminAccessToAllCollectionItems": true,
++        "limitCollectionCreation": false,
++        "limitCollectionDeletion": false,
++        "userIsManagedByOrganization": false,
++        "useSecretsManager": false,
++        "accessSecretsManager": false,
++        "usePasswordManager": true,
++        "useOrganizationDomains": false,
++        "useAutomaticUserConfirmation": false,
++        "maxAutoscaleSeats": Value::Null,
 +        "useGroups": false,
 +        "useDirectory": false,
 +        "useEvents": false,
@@ -4329,6 +4364,10 @@ index 0000000..e4dc09a
 +        "providerId": Value::Null,
 +        "providerName": Value::Null,
 +        "familySponsorshipFriendlyName": Value::Null,
++        "familySponsorshipValidUntil": Value::Null,
++        "familySponsorshipLastSyncDate": Value::Null,
++        "familySponsorshipToDelete": false,
++        "familySponsorshipAvailable": false,
 +        "keyConnectorEnabled": false,
 +        "keyConnectorUrl": Value::Null,
 +    })
