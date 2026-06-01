@@ -69,10 +69,10 @@ index 0000000..67c0a26
 +CREATE INDEX IF NOT EXISTS idx_collection_ciphers_cipher ON collection_ciphers(cipher_id);
 diff --git a/migrations/0016_add_org_enterprise.sql b/migrations/0016_add_org_enterprise.sql
 new file mode 100644
-index 0000000..aadbdd7
+index 0000000..adc401a
 --- /dev/null
 +++ b/migrations/0016_add_org_enterprise.sql
-@@ -0,0 +1,106 @@
+@@ -0,0 +1,122 @@
 +-- Enterprise org features (clean-room): Groups, Policies, Event logs, SSO (OIDC), SCIM.
 +-- All additive; nothing existing is modified.
 +
@@ -160,13 +160,29 @@ index 0000000..aadbdd7
 +);
 +
 +-- Short-lived OIDC login state (CSRF + nonce + PKCE verifier).
++-- client_* columns carry the web vault's own SSO params through the IdP round-trip.
 +CREATE TABLE IF NOT EXISTS sso_login_state (
 +    state TEXT PRIMARY KEY NOT NULL,
 +    organization_id TEXT NOT NULL,
 +    nonce TEXT NOT NULL,
 +    code_verifier TEXT NOT NULL,
 +    redirect_uri TEXT NOT NULL,
++    client_state TEXT,
++    client_redirect_uri TEXT,
++    client_code_challenge TEXT,
 +    created_at TEXT NOT NULL,
++    FOREIGN KEY (organization_id) REFERENCES organizations(id) ON DELETE CASCADE
++);
++
++-- One-time Bitwarden SSO authorization codes (issued at callback, redeemed at
++-- /identity/connect/token grant_type=authorization_code).
++CREATE TABLE IF NOT EXISTS sso_auth_codes (
++    code TEXT PRIMARY KEY NOT NULL,
++    user_id TEXT NOT NULL,
++    organization_id TEXT NOT NULL,
++    code_challenge TEXT,                    -- PKCE S256 challenge from the web vault
++    created_at TEXT NOT NULL,
++    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
 +    FOREIGN KEY (organization_id) REFERENCES organizations(id) ON DELETE CASCADE
 +);
 +
@@ -180,10 +196,10 @@ index 0000000..aadbdd7
 +);
 +CREATE INDEX IF NOT EXISTS idx_scim_tokens_hash ON scim_tokens(token_hash);
 diff --git a/sql/schema.sql b/sql/schema.sql
-index f8c4029..67a4375 100644
+index f8c4029..1eaeaed 100644
 --- a/sql/schema.sql
 +++ b/sql/schema.sql
-@@ -197,3 +197,172 @@ CREATE TABLE IF NOT EXISTS sends_pending (
+@@ -197,3 +197,185 @@ CREATE TABLE IF NOT EXISTS sends_pending (
    disabled INTEGER NOT NULL DEFAULT 0,
    hide_email INTEGER NOT NULL DEFAULT 0
  );
@@ -343,7 +359,20 @@ index f8c4029..67a4375 100644
 +    nonce TEXT NOT NULL,
 +    code_verifier TEXT NOT NULL,
 +    redirect_uri TEXT NOT NULL,
++    client_state TEXT,
++    client_redirect_uri TEXT,
++    client_code_challenge TEXT,
 +    created_at TEXT NOT NULL,
++    FOREIGN KEY (organization_id) REFERENCES organizations(id) ON DELETE CASCADE
++);
++
++CREATE TABLE IF NOT EXISTS sso_auth_codes (
++    code TEXT PRIMARY KEY NOT NULL,
++    user_id TEXT NOT NULL,
++    organization_id TEXT NOT NULL,
++    code_challenge TEXT,
++    created_at TEXT NOT NULL,
++    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
 +    FOREIGN KEY (organization_id) REFERENCES organizations(id) ON DELETE CASCADE
 +);
 +
@@ -357,13 +386,23 @@ index f8c4029..67a4375 100644
 +);
 +CREATE INDEX IF NOT EXISTS idx_scim_tokens_hash ON scim_tokens(token_hash);
 diff --git a/src/crypto.rs b/src/crypto.rs
-index 8882e51..c2e29bc 100644
+index 8882e51..14d2ffa 100644
 --- a/src/crypto.rs
 +++ b/src/crypto.rs
-@@ -331,3 +331,60 @@ pub fn generate_api_key() -> Result<String, AppError> {
+@@ -331,3 +331,70 @@ pub fn generate_api_key() -> Result<String, AppError> {
  pub fn ct_eq(a: &str, b: &str) -> bool {
      constant_time_eq(a.as_bytes(), b.as_bytes())
  }
++
++/// PKCE S256 transform: base64url-nopad(SHA-256(code_verifier)).
++pub fn pkce_s256(verifier: &str) -> String {
++    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
++    use base64::Engine;
++    use sha2::Digest;
++    let mut h = Sha256::new();
++    h.update(verifier.as_bytes());
++    URL_SAFE_NO_PAD.encode(h.finalize())
++}
 +
 +/// Verify an RS256 signature against an RSA public key supplied as a JWK.
 +/// Used for OIDC id_token verification. Returns Ok(true) only on a valid signature.
@@ -1159,6 +1198,85 @@ index 0000000..d8c1937
 +        .collect();
 +    Ok(Json(json!({ "data": items, "object": "list", "continuationToken": Value::Null })))
 +}
+diff --git a/src/handlers/identity.rs b/src/handlers/identity.rs
+index aed37db..cc21b94 100644
+--- a/src/handlers/identity.rs
++++ b/src/handlers/identity.rs
+@@ -89,6 +89,11 @@ pub struct TokenRequest {
+     device_name: Option<String>,
+     #[serde(rename = "device_type", alias = "deviceType", alias = "devicetype")]
+     device_type: Option<String>,
++    // SSO authorization-code grant (issued by /sso/callback).
++    #[serde(default)]
++    code: Option<String>,
++    #[serde(rename = "code_verifier", alias = "codeVerifier", default)]
++    code_verifier: Option<String>,
+ }
+ 
+ #[derive(Debug)]
+@@ -785,6 +790,62 @@ pub async fn token(
+ 
+             generate_tokens_and_response(user, &device, &device_request.client_id, &env, None)
+         }
++        "authorization_code" => {
++            // SSO login: redeem the one-time code minted by /sso/callback after the IdP's
++            // id_token was signature-verified. Optional PKCE (S256) per the web vault.
++            let code = required_field(payload.code.as_deref(), "code")?;
++
++            #[derive(serde::Deserialize)]
++            struct AuthCodeRow {
++                user_id: String,
++                code_challenge: Option<String>,
++            }
++            let row: Option<AuthCodeRow> = db
++                .prepare("SELECT user_id, code_challenge FROM sso_auth_codes WHERE code = ?1")
++                .bind(&[code.clone().into()])?
++                .first(None)
++                .await
++                .map_err(|_| AppError::Database)?;
++            let row = row.ok_or_else(|| AppError::BadRequest("invalid_grant".to_string()))?;
++            // One-time use.
++            let _ = db
++                .prepare("DELETE FROM sso_auth_codes WHERE code = ?1")
++                .bind(&[code.clone().into()])?
++                .run()
++                .await;
++
++            if let Some(challenge) = row.code_challenge {
++                let verifier = required_field(payload.code_verifier.as_deref(), "code_verifier")?;
++                if !crate::crypto::ct_eq(&crate::crypto::pkce_s256(&verifier), &challenge) {
++                    return Err(AppError::BadRequest("invalid_grant".to_string()));
++                }
++            }
++
++            let user = load_user_by_id(&db, &row.user_id)
++                .await
++                .map_err(|_| AppError::Unauthorized("invalid_grant".to_string()))?;
++
++            let device_request = DeviceAuthRequest {
++                client_id: payload.client_id.clone().unwrap_or_else(|| "web".to_string()),
++                identifier: required_field(
++                    payload.device_identifier.as_deref(),
++                    "device_identifier",
++                )?,
++                name: required_field(payload.device_name.as_deref(), "device_name")?,
++                r#type: parse_required_device_type(payload.device_type.as_deref(), "device_type")?,
++            };
++            let mut device = Device::get_or_create(
++                &db,
++                device_request.identifier,
++                user.id.clone(),
++                device_request.name,
++                device_request.r#type,
++            )
++            .await?;
++            device.touch(&db).await?;
++
++            generate_tokens_and_response(user, &device, &device_request.client_id, &env, None)
++        }
+         _ => Err(AppError::BadRequest("Unsupported grant_type".to_string())),
+     }
+ }
 diff --git a/src/handlers/mod.rs b/src/handlers/mod.rs
 index 1c809c6..b551923 100644
 --- a/src/handlers/mod.rs
@@ -3101,10 +3219,10 @@ index 0000000..ef714af
 +}
 diff --git a/src/handlers/sso.rs b/src/handlers/sso.rs
 new file mode 100644
-index 0000000..2382ed1
+index 0000000..37154b4
 --- /dev/null
 +++ b/src/handlers/sso.rs
-@@ -0,0 +1,507 @@
+@@ -0,0 +1,549 @@
 +//! Organization SSO (OIDC).
 +//!
 +//! STATUS — honest boundary: config storage + management are complete. The login flow
@@ -3119,7 +3237,7 @@ index 0000000..2382ed1
 +//! Connector/TDE). The connector + token issuance is the one remaining, clearly-marked piece.
 +
 +use axum::extract::{Path, Query, State};
-+use axum::response::{Html, Redirect};
++use axum::response::{Html, IntoResponse, Redirect, Response};
 +use axum::Json;
 +use serde::Deserialize;
 +use serde_json::{json, Value};
@@ -3272,6 +3390,13 @@ index 0000000..2382ed1
 +#[derive(Debug, Deserialize)]
 +pub struct AuthorizeQuery {
 +    pub identifier: String,
++    /// The web vault's own state, carried through the IdP round-trip.
++    #[serde(default)]
++    pub state: Option<String>,
++    #[serde(rename = "redirectUri", alias = "redirect_uri", default)]
++    pub redirect_uri: Option<String>,
++    #[serde(rename = "codeChallenge", alias = "code_challenge", default)]
++    pub code_challenge: Option<String>,
 +}
 +
 +/// GET /sso/authorize?identifier=<id> — redirect the browser to the IdP.
@@ -3316,13 +3441,17 @@ index 0000000..2382ed1
 +
 +    d1_query!(
 +        &db,
-+        "INSERT INTO sso_login_state (state, organization_id, nonce, code_verifier, redirect_uri, created_at) \
-+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
++        "INSERT INTO sso_login_state (state, organization_id, nonce, code_verifier, redirect_uri, \
++         client_state, client_redirect_uri, client_code_challenge, created_at) \
++         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
 +        state,
 +        org.organization_id,
 +        nonce,
 +        code_verifier,
 +        redirect_uri,
++        q.state,
++        q.redirect_uri,
++        q.code_challenge,
 +        now
 +    )
 +    .map_err(|_| AppError::Database)?
@@ -3353,24 +3482,28 @@ index 0000000..2382ed1
 +struct LoginStateRow {
 +    organization_id: String,
 +    nonce: String,
-+    #[allow(dead_code)] // reserved for PKCE code-exchange (not sent in the scaffold exchange)
++    #[allow(dead_code)] // reserved for PKCE on the IdP token exchange (IdP-side, separate from client PKCE)
 +    code_verifier: String,
 +    redirect_uri: String,
++    client_state: Option<String>,
++    client_redirect_uri: Option<String>,
++    client_code_challenge: Option<String>,
 +}
 +
 +/// GET /sso/callback — exchange the code, link the IdP subject to a warden user.
 +///
-+/// SCAFFOLD: this exchanges the code and reads the id_token claims, but does NOT verify
-+/// the id_token signature against the IdP JWKS, and does NOT issue Bitwarden client
-+/// tokens. It links the IdP subject to an existing warden account (by email) in
-+/// `sso_users` and reports the result. Do not treat this as an authenticated login.
++/// Verifies the IdP id_token (JWKS RS256 + iss/aud/exp/nonce), links the IdP subject to
++/// a warden account, then mints a one-time Bitwarden SSO authorization code and redirects
++/// back to the web vault (`client_redirect_uri?code=…&state=…`). The web vault redeems the
++/// code at `/identity/connect/token` (grant_type=authorization_code). If no web-vault
++/// redirect was provided (direct test), it shows an HTML result instead.
 +#[worker::send]
 +pub async fn callback(
 +    State(env): State<Arc<Env>>,
 +    Query(q): Query<CallbackQuery>,
-+) -> Result<Html<String>, AppError> {
++) -> Result<Response, AppError> {
 +    if let Some(err) = q.error {
-+        return Ok(Html(format!("<h1>SSO error</h1><p>{}</p>", escape(&err))));
++        return Ok(Html(format!("<h1>SSO error</h1><p>{}</p>", escape(&err))).into_response());
 +    }
 +    let code = q.code.ok_or_else(|| AppError::BadRequest("missing code".to_string()))?;
 +    let state = q.state.ok_or_else(|| AppError::BadRequest("missing state".to_string()))?;
@@ -3378,7 +3511,8 @@ index 0000000..2382ed1
 +
 +    let login: LoginStateRow = d1_query!(
 +        &db,
-+        "SELECT organization_id, nonce, code_verifier, redirect_uri FROM sso_login_state WHERE state = ?1",
++        "SELECT organization_id, nonce, code_verifier, redirect_uri, client_state, \
++         client_redirect_uri, client_code_challenge FROM sso_login_state WHERE state = ?1",
 +        state
 +    )
 +    .map_err(|_| AppError::Database)?
@@ -3426,7 +3560,7 @@ index 0000000..2382ed1
 +        .unwrap_or("")
 +        .to_lowercase();
 +    if sub.is_empty() || email.is_empty() {
-+        return Ok(Html("<h1>SSO</h1><p>id_token missing sub/email.</p>".to_string()));
++        return Ok(Html("<h1>SSO</h1><p>id_token missing sub/email.</p>".to_string()).into_response());
 +    }
 +
 +    // Link to an existing account by email (we never auto-create vault accounts).
@@ -3442,7 +3576,7 @@ index 0000000..2382ed1
 +        return Ok(Html(format!(
 +            "<h1>SSO verified</h1><p>IdP identity <code>{}</code> verified, but no vault account exists for it yet. Create one first, then link.</p>",
 +            escape(&email)
-+        )));
++        )).into_response());
 +    };
 +
 +    let now = db::now_string();
@@ -3458,11 +3592,37 @@ index 0000000..2382ed1
 +    .run()
 +    .await?;
 +
++    // Mint a one-time Bitwarden SSO authorization code and hand control back to the web vault.
++    if let Some(redirect) = login.client_redirect_uri {
++        let bw_code = Uuid::new_v4().to_string();
++        d1_query!(
++            &db,
++            "INSERT INTO sso_auth_codes (code, user_id, organization_id, code_challenge, created_at) \
++             VALUES (?1, ?2, ?3, ?4, ?5)",
++            bw_code,
++            user.id,
++            login.organization_id,
++            login.client_code_challenge,
++            now
++        )
++        .map_err(|_| AppError::Database)?
++        .run()
++        .await?;
++        let sep = if redirect.contains('?') { '&' } else { '?' };
++        let url = format!(
++            "{redirect}{sep}code={}&state={}",
++            urlencode(&bw_code),
++            urlencode(login.client_state.as_deref().unwrap_or("")),
++        );
++        return Ok(Redirect::temporary(&url).into_response());
++    }
++
++    // No web-vault redirect (direct test): show the verified result.
 +    Ok(Html(format!(
 +        "<h1>SSO identity verified + linked</h1><p>Your IdP's id_token was signature-verified (JWKS RS256, iss/aud/exp/nonce) and linked to the vault account for <code>{}</code>.</p>\
-+         <p><em>Note: this does not yet issue a Bitwarden client session via the web-vault SSO connector — sign in with your master password as usual. The vault is end-to-end encrypted, so SSO alone can't decrypt it without your master password.</em></p>",
++         <p>An SSO authorization code can now be redeemed at <code>/identity/connect/token</code> (grant_type=authorization_code). Without a web-vault redirect this page just confirms verification.</p>",
 +        escape(&email)
-+    )))
++    )).into_response())
 +}
 +
 +// ---- helpers ----

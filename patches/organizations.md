@@ -108,20 +108,25 @@ These go beyond "orgs + shared collections" — added on request, all compiling:
 - **SSO (OIDC)** — config storage + management (`…/organizations/{id}/sso`) and an
   authorize/callback OIDC flow.
 
-### ⚠️ Honest boundary on SSO
+### SSO is now built end-to-end (to spec) — one honest verification caveat
 
-The OIDC flow now does **real verification**: the callback runs OIDC discovery, fetches the IdP's
-JWKS, and **verifies the id_token's RS256 signature (via WebCrypto) plus iss / aud / exp / nonce**
-before linking the IdP subject to a vault account (`sso_users`). So identity is genuinely
-authenticated, not just decoded.
+The full OIDC login flow is implemented:
 
-The **one** remaining piece: it does **not** issue Bitwarden client session tokens via the official
-web-vault **SSO connector handshake** (prevalidate → connector redirect → `authorization_code` token
-exchange). That contract is version-coupled to the web vault and needs a live IdP + web-vault to
-verify, so it's left clearly marked rather than shipped unverified. Net effect today: SSO is a
-**verified identity link**, and users still sign in with their master password — which is required
-anyway, because the vault is end-to-end encrypted and SSO can't decrypt it without the master
-password (absent Key Connector / TDE, which are not included).
+1. `prevalidate` → `authorize` redirects to the IdP, carrying the web vault's `state` /
+   `redirectUri` / `codeChallenge` through the round-trip.
+2. `callback` runs OIDC **discovery**, fetches the IdP **JWKS**, and **verifies the id_token's RS256
+   signature (WebCrypto) + iss/aud/exp/nonce** — real authentication, not a decode.
+3. It links the IdP subject to a vault account, mints a **one-time Bitwarden SSO authorization code**,
+   and redirects back to the web vault.
+4. `/identity/connect/token` has an **`authorization_code` grant** (with **PKCE S256**) that redeems
+   the code and issues real warden access/refresh tokens via the same path as password login.
+
+**The one caveat:** this follows the documented Bitwarden SSO-connector contract but has **not been
+verified against a live official web vault** (that handshake is version-coupled — exact prevalidate
+token shape, connector redirect URLs, PKCE params). It compiles and is spec-correct; confirm it
+against your web vault before relying on it. Also note: even working SSO does **not** give
+password-less unlock — the vault is end-to-end encrypted, so you still enter your master password to
+decrypt (password-less needs Key Connector / TDE, separate large subsystems, not included).
 
 ## Still not included
 

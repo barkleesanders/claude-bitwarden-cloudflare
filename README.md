@@ -82,7 +82,7 @@ Prefer manual? See [`docs/INSTALL.md`](docs/INSTALL.md).
 ## What works / what doesn't
 **Works:** logins, folders, TOTP, attachments (KV/R2), Bitwarden Send, device management, live sync/push, equivalent-domain matching, HIBP breach checks, 2FA (authenticator app), and the added **API key / `bw login --apikey`**. All official Bitwarden clients.
 **Works (optional patch):** Organizations, shared Collections, member invites + confirm, cipher sharing, **Groups, org policies, event-log audit, SCIM provisioning** — ACL-enforced, Cloudflare-native invites, optional outbound email ([details](patches/organizations.md)).
-**SSO (OIDC):** config + a flow that **really verifies** the id_token (JWKS RS256 + iss/aud/exp/nonce) and links identity. Remaining: issuing client session tokens via the official web-vault SSO connector (needs live IdP+web-vault testing); users still use their master password (E2E vault). No Key Connector/TDE, Travel Mode, or Watchtower. Honest boundary in the patch doc.
+**SSO (OIDC):** full flow built — discovery + JWKS **RS256 id_token verification**, identity link, one-time SSO code, and an `authorization_code` token grant (PKCE) that issues real sessions. Caveat: spec-correct but **not yet verified against a live official web vault**; and the E2E vault still needs your master password to decrypt (no Key Connector/TDE). No Travel Mode/Watchtower. Honest boundary in the patch doc.
 
 ## Security defaults this playbook sets
 - **`ALLOWED_EMAILS`** — only your address can register (the endpoint is public, but locked to you)
