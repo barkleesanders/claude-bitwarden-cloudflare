@@ -464,6 +464,78 @@ index 8882e51..df2a8ba 100644
 +
 +    Ok(verified.as_bool().unwrap_or(false))
 +}
+diff --git a/src/handlers/accounts.rs b/src/handlers/accounts.rs
+index b960a85..ace3b12 100644
+--- a/src/handlers/accounts.rs
++++ b/src/handlers/accounts.rs
+@@ -208,6 +208,8 @@ pub async fn register(
+         }
+     }
+ 
++    let db = db::get_db(&env)?;
++
+     let allowed_emails = env
+         .secret("ALLOWED_EMAILS")
+         .map_err(|_| AppError::Internal)?;
+@@ -215,10 +217,27 @@ pub async fn register(
+         .as_ref()
+         .as_string()
+         .ok_or_else(|| AppError::Internal)?;
+-    if !allowed_emails
++    let allowed_by_list = allowed_emails
+         .split(',')
+-        .any(|pattern| glob_match(pattern.trim(), &payload.email))
+-    {
++        .any(|pattern| glob_match(pattern.trim(), &payload.email));
++
++    // Also allow anyone holding a pending organization invite for this email, so org
++    // admins don't have to hand-edit ALLOWED_EMAILS for every person they invite.
++    #[derive(serde::Deserialize)]
++    struct InvitedEmailRow {
++        #[allow(dead_code)]
++        email: String,
++    }
++    let invited: Option<InvitedEmailRow> = d1_query!(
++        &db,
++        "SELECT email FROM organization_users WHERE lower(email) = ?1 LIMIT 1",
++        payload.email.to_lowercase()
++    )
++    .map_err(|_| AppError::Database)?
++    .first(None)
++    .await?;
++
++    if !allowed_by_list && invited.is_none() {
+         return Err(AppError::Unauthorized("Not allowed to signup".to_string()));
+     }
+ 
+@@ -239,7 +258,6 @@ pub async fn register(
+     )
+     .await?;
+ 
+-    let db = db::get_db(&env)?;
+     let now = db::now_string();
+ 
+     // Only store kdf_memory and kdf_parallelism for Argon2id, clear for PBKDF2
+@@ -308,6 +326,19 @@ pub async fn register(
+         AppError::Database
+     })?;
+ 
++    // Link any pending org invites for this email to the new account (so the
++    // invitation shows up in their vault and an admin can confirm them).
++    let _ = d1_query!(
++        &db,
++        "UPDATE organization_users SET user_id = ?1, updated_at = ?2 WHERE lower(email) = ?3 AND user_id IS NULL",
++        user.id,
++        user.updated_at,
++        user.email
++    )
++    .map_err(|_| AppError::Database)?
++    .run()
++    .await;
++
+     Ok(Json(json!({})))
+ }
+ 
 diff --git a/src/handlers/ciphers.rs b/src/handlers/ciphers.rs
 index f155c55..5002e7e 100644
 --- a/src/handlers/ciphers.rs

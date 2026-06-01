@@ -27,7 +27,7 @@ function verify(idToken, jwks, {issuer, clientId, nonce}){
 // ---- correctness cases against a controlled IdP ----
 const {publicKey,privateKey}=crypto.generateKeyPairSync('rsa',{modulusLength:2048});
 const kid='test-key-1', jwks={keys:[jwkFromPub(publicKey,kid)]};
-const base={iss:'https://idp.example.com',aud:'client-123',sub:'user-abc',email:'help@aivaclaims.com',exp:Math.floor(Date.now()/1000)+300,nonce:'NONCE1'};
+const base={iss:'https://idp.example.com',aud:'client-123',sub:'user-abc',email:'test@example.com',exp:Math.floor(Date.now()/1000)+300,nonce:'NONCE1'};
 const opts={issuer:base.iss,clientId:base.aud,nonce:base.nonce};
 let pass=0,fail=0; const t=(n,fn,shouldThrow)=>{try{fn();if(shouldThrow){console.log('✗',n,'(expected reject)');fail++}else{console.log('✓',n);pass++}}catch(e){if(shouldThrow){console.log('✓',n,'→ rejected:',e.message);pass++}else{console.log('✗',n,'→',e.message);fail++}}};
 t('valid token accepted',()=>verify(signJwt(base,privateKey,kid),jwks,opts),false);
