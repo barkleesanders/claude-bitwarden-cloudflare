@@ -44,7 +44,7 @@ Running cost: **$0/year** (Cloudflare free tier; you already own the domain). He
 | 250 | $12,000 | $24,000 | ~$0–$60 | **$12k–24k** |
 | 1,000 | $48,000 | $96,000 | ~$60–$600 | **$47k–95k** |
 
-**Organizations + sharing:** base warden-worker is personal-vault only, but an optional **working** clean-room patch ([`patches/organizations.md`](patches/organizations.md)) adds **Organizations, shared Collections, member invites, and cipher sharing** — ACL-enforced, Cloudflare-native invites (manual-confirm, no external email), builds clean. So this **can** be a team-sharing setup, not just a personal vault. Still deferred (enterprise extras, not needed for sharing): SSO/SCIM, Groups, policies, event logs. Said up front on purpose.
+**Organizations + sharing:** base warden-worker is personal-vault only, but an optional **working** clean-room patch ([`patches/organizations.md`](patches/organizations.md)) adds **Organizations, shared Collections, member invites, and cipher sharing** — ACL-enforced, Cloudflare-native invites (manual-confirm, no external email), builds clean. So this **can** be a team-sharing setup, not just a personal vault — now including Groups, org policies, event-log audit, and SCIM provisioning. (SSO is a config + OIDC scaffold, not yet a full login path — honest boundary in the patch doc.) Said up front on purpose.
 
 ---
 
@@ -81,8 +81,8 @@ Prefer manual? See [`docs/INSTALL.md`](docs/INSTALL.md).
 
 ## What works / what doesn't
 **Works:** logins, folders, TOTP, attachments (KV/R2), Bitwarden Send, device management, live sync/push, equivalent-domain matching, HIBP breach checks, 2FA (authenticator app), and the added **API key / `bw login --apikey`**. All official Bitwarden clients.
-**Works (optional patch):** Organizations, shared Collections, member invites + confirm, cipher sharing — ACL-enforced, Cloudflare-native invites ([details](patches/organizations.md)).
-**Doesn't:** SSO/SCIM, Groups, org policies, event logs, Travel Mode, Watchtower dashboards. Not a full enterprise suite — but real team sharing works.
+**Works (optional patch):** Organizations, shared Collections, member invites + confirm, cipher sharing, **Groups, org policies, event-log audit, SCIM provisioning** — ACL-enforced, Cloudflare-native invites, optional outbound email ([details](patches/organizations.md)).
+**Partial/not done:** **SSO** is config + an OIDC scaffold (identity-link only — no id_token signature verify or client-token issuance; users still use their master password). Plus no Key Connector/TDE, Travel Mode, or Watchtower. Honest boundary stated in the patch doc.
 
 ## Security defaults this playbook sets
 - **`ALLOWED_EMAILS`** — only your address can register (the endpoint is public, but locked to you)

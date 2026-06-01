@@ -18,10 +18,12 @@ cd warden-worker
 git apply ../claude-bitwarden-cloudflare/patches/api-key.patch          # if not already applied
 git apply ../claude-bitwarden-cloudflare/patches/organizations.patch
 cp ../claude-bitwarden-cloudflare/patches/0015_add_organizations.sql migrations/0015_add_organizations.sql
+cp ../claude-bitwarden-cloudflare/patches/0016_add_org_enterprise.sql migrations/0016_add_org_enterprise.sql
 ```
 
-Verified: applies cleanly on top of `api-key.patch`; builds with `worker-build --release`
-(0 errors, 0 clippy warnings). ~2,100 insertions across 10 files.
+Verified end-to-end: applied to a **fresh clone + api-key.patch**, it `cargo check`s and builds
+with `worker-build --release` from scratch (0 errors, 0 clippy warnings). ~3,800 insertions across
+15 files.
 
 ## What it adds (full working flow)
 
@@ -88,11 +90,42 @@ not required for the flow to work.
 - The server stores only the org RSA keypair (private key already encrypted with the org symmetric
   key) and, per member, the org symmetric key wrapped with that member's public key. Never plaintext.
 
-## Genuinely deferred (not needed for orgs + shared collections to work)
+## Enterprise features (also included)
 
-Groups, SSO/SCIM, policies, event logs, admin reset-password, the `access_all` membership flag,
-outbound invite email, and org-cipher **archive/partial-field** edits (personal-vault features).
-None of these block the create-org → invite → confirm → share → use flow.
+These go beyond "orgs + shared collections" — added on request, all compiling:
+
+- **Groups** — group CRUD, group↔collection grants, group membership; group-based access is
+  honored in the cipher ACL (sync/read/edit). `…/organizations/{id}/groups[...]`.
+- **Policies** — upsert/list/read org policies. `…/organizations/{id}/policies[/{type}]`.
+- **Event logs** — an audit trail of org admin actions (org/member/collection/group/policy
+  mutations), readable by admins. `GET …/organizations/{id}/events`.
+- **Outbound invite email** — best-effort, **optional**. No-op unless you set
+  `EMAIL_PROVIDER_URL` + `EMAIL_API_KEY` (secret) + `EMAIL_FROM` (any Resend-compatible JSON
+  endpoint). Invites work fully without it (manual-confirm).
+- **SCIM v2 provisioning** — bearer-token Users endpoints (`/scim/v2/{orgId}/Users`) for
+  list/create/get/delete, plus token management (`…/organizations/{id}/scim/tokens`). Maps to org
+  memberships.
+- **SSO (OIDC)** — config storage + management (`…/organizations/{id}/sso`) and an
+  authorize/callback OIDC flow.
+
+### ⚠️ Honest boundary on SSO
+
+SSO config + the OIDC authorize/callback are a **scaffold, not a production login path**. The
+callback exchanges the code and links the IdP subject to a vault account (`sso_users`), but it does
+**not** verify the id_token signature against the IdP JWKS, and does **not** issue Bitwarden client
+session tokens via the SSO connector handshake. Treat it as identity-link verification, not
+authentication — users still sign in with their master password. Wiring full SSO login (JWKS verify
++ connector + token issuance) is genuinely a large subsystem and is left as the one clearly-marked
+incomplete piece, rather than shipped as if finished. (This is also fine because the vault is
+end-to-end encrypted — SSO can't decrypt it without the master password anyway, absent Key
+Connector/TDE, which are not included.)
+
+## Still not included
+
+Admin reset-password (Key Connector / TDE), the `access_all` membership flag, and org-cipher
+**favorite/folder partial edits** (these are per-user personal associations the shared schema can't
+model without a per-user cipher-state table — archive *is* extended to org managers). None block the
+create-org → invite → confirm → share → use flow.
 
 ## Deploying it (additive + backward-compatible)
 

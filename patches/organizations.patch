@@ -67,11 +67,123 @@ index 0000000..67c0a26
 +    FOREIGN KEY (cipher_id) REFERENCES ciphers(id) ON DELETE CASCADE
 +);
 +CREATE INDEX IF NOT EXISTS idx_collection_ciphers_cipher ON collection_ciphers(cipher_id);
+diff --git a/migrations/0016_add_org_enterprise.sql b/migrations/0016_add_org_enterprise.sql
+new file mode 100644
+index 0000000..aadbdd7
+--- /dev/null
++++ b/migrations/0016_add_org_enterprise.sql
+@@ -0,0 +1,106 @@
++-- Enterprise org features (clean-room): Groups, Policies, Event logs, SSO (OIDC), SCIM.
++-- All additive; nothing existing is modified.
++
++-- ---- Groups ----
++CREATE TABLE IF NOT EXISTS groups (
++    id TEXT PRIMARY KEY NOT NULL,
++    organization_id TEXT NOT NULL,
++    name TEXT NOT NULL,
++    external_id TEXT,
++    created_at TEXT NOT NULL,
++    updated_at TEXT NOT NULL,
++    FOREIGN KEY (organization_id) REFERENCES organizations(id) ON DELETE CASCADE
++);
++CREATE INDEX IF NOT EXISTS idx_groups_org ON groups(organization_id);
++
++CREATE TABLE IF NOT EXISTS group_users (
++    group_id TEXT NOT NULL,
++    organization_user_id TEXT NOT NULL,
++    PRIMARY KEY (group_id, organization_user_id),
++    FOREIGN KEY (group_id) REFERENCES groups(id) ON DELETE CASCADE,
++    FOREIGN KEY (organization_user_id) REFERENCES organization_users(id) ON DELETE CASCADE
++);
++
++CREATE TABLE IF NOT EXISTS collection_groups (
++    collection_id TEXT NOT NULL,
++    group_id TEXT NOT NULL,
++    read_only INTEGER NOT NULL DEFAULT 0,
++    hide_passwords INTEGER NOT NULL DEFAULT 0,
++    manage INTEGER NOT NULL DEFAULT 0,
++    PRIMARY KEY (collection_id, group_id),
++    FOREIGN KEY (collection_id) REFERENCES collections(id) ON DELETE CASCADE,
++    FOREIGN KEY (group_id) REFERENCES groups(id) ON DELETE CASCADE
++);
++
++-- ---- Policies ----
++CREATE TABLE IF NOT EXISTS org_policies (
++    organization_id TEXT NOT NULL,
++    ptype INTEGER NOT NULL,                 -- Bitwarden PolicyType enum
++    enabled INTEGER NOT NULL DEFAULT 0,
++    data TEXT,                              -- JSON config blob (nullable)
++    PRIMARY KEY (organization_id, ptype),
++    FOREIGN KEY (organization_id) REFERENCES organizations(id) ON DELETE CASCADE
++);
++
++-- ---- Event logs ----
++CREATE TABLE IF NOT EXISTS org_events (
++    id TEXT PRIMARY KEY NOT NULL,
++    organization_id TEXT NOT NULL,
++    event_type INTEGER NOT NULL,            -- Bitwarden EventType enum
++    acting_user_id TEXT,                    -- who performed it
++    member_id TEXT,                         -- affected organization_users.id
++    cipher_id TEXT,
++    collection_id TEXT,
++    group_id TEXT,
++    policy_id INTEGER,
++    device_type INTEGER,
++    ip_address TEXT,
++    created_at TEXT NOT NULL,
++    FOREIGN KEY (organization_id) REFERENCES organizations(id) ON DELETE CASCADE
++);
++CREATE INDEX IF NOT EXISTS idx_org_events_org ON org_events(organization_id, created_at);
++
++-- ---- SSO (OIDC) ----
++CREATE TABLE IF NOT EXISTS org_sso_config (
++    organization_id TEXT PRIMARY KEY NOT NULL,
++    enabled INTEGER NOT NULL DEFAULT 0,
++    identifier TEXT UNIQUE,                 -- the org's SSO identifier users type at login
++    authority TEXT,                         -- OIDC issuer URL
++    client_id TEXT,
++    client_secret TEXT,
++    created_at TEXT NOT NULL,
++    updated_at TEXT NOT NULL,
++    FOREIGN KEY (organization_id) REFERENCES organizations(id) ON DELETE CASCADE
++);
++
++-- Links an IdP subject to a warden user, per org.
++CREATE TABLE IF NOT EXISTS sso_users (
++    organization_id TEXT NOT NULL,
++    external_id TEXT NOT NULL,              -- IdP subject (sub claim)
++    user_id TEXT NOT NULL,
++    created_at TEXT NOT NULL,
++    PRIMARY KEY (organization_id, external_id),
++    FOREIGN KEY (organization_id) REFERENCES organizations(id) ON DELETE CASCADE,
++    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
++);
++
++-- Short-lived OIDC login state (CSRF + nonce + PKCE verifier).
++CREATE TABLE IF NOT EXISTS sso_login_state (
++    state TEXT PRIMARY KEY NOT NULL,
++    organization_id TEXT NOT NULL,
++    nonce TEXT NOT NULL,
++    code_verifier TEXT NOT NULL,
++    redirect_uri TEXT NOT NULL,
++    created_at TEXT NOT NULL,
++    FOREIGN KEY (organization_id) REFERENCES organizations(id) ON DELETE CASCADE
++);
++
++-- ---- SCIM ----
++CREATE TABLE IF NOT EXISTS scim_tokens (
++    id TEXT PRIMARY KEY NOT NULL,
++    organization_id TEXT NOT NULL,
++    token_hash TEXT NOT NULL,               -- SHA-256 of the bearer token
++    created_at TEXT NOT NULL,
++    FOREIGN KEY (organization_id) REFERENCES organizations(id) ON DELETE CASCADE
++);
++CREATE INDEX IF NOT EXISTS idx_scim_tokens_hash ON scim_tokens(token_hash);
 diff --git a/sql/schema.sql b/sql/schema.sql
-index f8c4029..45a90ad 100644
+index f8c4029..67a4375 100644
 --- a/sql/schema.sql
 +++ b/sql/schema.sql
-@@ -197,3 +197,66 @@ CREATE TABLE IF NOT EXISTS sends_pending (
+@@ -197,3 +197,172 @@ CREATE TABLE IF NOT EXISTS sends_pending (
    disabled INTEGER NOT NULL DEFAULT 0,
    hide_email INTEGER NOT NULL DEFAULT 0
  );
@@ -138,8 +250,114 @@ index f8c4029..45a90ad 100644
 +    FOREIGN KEY (cipher_id) REFERENCES ciphers(id) ON DELETE CASCADE
 +);
 +CREATE INDEX IF NOT EXISTS idx_collection_ciphers_cipher ON collection_ciphers(cipher_id);
++-- Enterprise org features (clean-room): Groups, Policies, Event logs, SSO (OIDC), SCIM.
++-- All additive; nothing existing is modified.
++
++-- ---- Groups ----
++CREATE TABLE IF NOT EXISTS groups (
++    id TEXT PRIMARY KEY NOT NULL,
++    organization_id TEXT NOT NULL,
++    name TEXT NOT NULL,
++    external_id TEXT,
++    created_at TEXT NOT NULL,
++    updated_at TEXT NOT NULL,
++    FOREIGN KEY (organization_id) REFERENCES organizations(id) ON DELETE CASCADE
++);
++CREATE INDEX IF NOT EXISTS idx_groups_org ON groups(organization_id);
++
++CREATE TABLE IF NOT EXISTS group_users (
++    group_id TEXT NOT NULL,
++    organization_user_id TEXT NOT NULL,
++    PRIMARY KEY (group_id, organization_user_id),
++    FOREIGN KEY (group_id) REFERENCES groups(id) ON DELETE CASCADE,
++    FOREIGN KEY (organization_user_id) REFERENCES organization_users(id) ON DELETE CASCADE
++);
++
++CREATE TABLE IF NOT EXISTS collection_groups (
++    collection_id TEXT NOT NULL,
++    group_id TEXT NOT NULL,
++    read_only INTEGER NOT NULL DEFAULT 0,
++    hide_passwords INTEGER NOT NULL DEFAULT 0,
++    manage INTEGER NOT NULL DEFAULT 0,
++    PRIMARY KEY (collection_id, group_id),
++    FOREIGN KEY (collection_id) REFERENCES collections(id) ON DELETE CASCADE,
++    FOREIGN KEY (group_id) REFERENCES groups(id) ON DELETE CASCADE
++);
++
++-- ---- Policies ----
++CREATE TABLE IF NOT EXISTS org_policies (
++    organization_id TEXT NOT NULL,
++    ptype INTEGER NOT NULL,                 -- Bitwarden PolicyType enum
++    enabled INTEGER NOT NULL DEFAULT 0,
++    data TEXT,                              -- JSON config blob (nullable)
++    PRIMARY KEY (organization_id, ptype),
++    FOREIGN KEY (organization_id) REFERENCES organizations(id) ON DELETE CASCADE
++);
++
++-- ---- Event logs ----
++CREATE TABLE IF NOT EXISTS org_events (
++    id TEXT PRIMARY KEY NOT NULL,
++    organization_id TEXT NOT NULL,
++    event_type INTEGER NOT NULL,            -- Bitwarden EventType enum
++    acting_user_id TEXT,                    -- who performed it
++    member_id TEXT,                         -- affected organization_users.id
++    cipher_id TEXT,
++    collection_id TEXT,
++    group_id TEXT,
++    policy_id INTEGER,
++    device_type INTEGER,
++    ip_address TEXT,
++    created_at TEXT NOT NULL,
++    FOREIGN KEY (organization_id) REFERENCES organizations(id) ON DELETE CASCADE
++);
++CREATE INDEX IF NOT EXISTS idx_org_events_org ON org_events(organization_id, created_at);
++
++-- ---- SSO (OIDC) ----
++CREATE TABLE IF NOT EXISTS org_sso_config (
++    organization_id TEXT PRIMARY KEY NOT NULL,
++    enabled INTEGER NOT NULL DEFAULT 0,
++    identifier TEXT UNIQUE,                 -- the org's SSO identifier users type at login
++    authority TEXT,                         -- OIDC issuer URL
++    client_id TEXT,
++    client_secret TEXT,
++    created_at TEXT NOT NULL,
++    updated_at TEXT NOT NULL,
++    FOREIGN KEY (organization_id) REFERENCES organizations(id) ON DELETE CASCADE
++);
++
++-- Links an IdP subject to a warden user, per org.
++CREATE TABLE IF NOT EXISTS sso_users (
++    organization_id TEXT NOT NULL,
++    external_id TEXT NOT NULL,              -- IdP subject (sub claim)
++    user_id TEXT NOT NULL,
++    created_at TEXT NOT NULL,
++    PRIMARY KEY (organization_id, external_id),
++    FOREIGN KEY (organization_id) REFERENCES organizations(id) ON DELETE CASCADE,
++    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
++);
++
++-- Short-lived OIDC login state (CSRF + nonce + PKCE verifier).
++CREATE TABLE IF NOT EXISTS sso_login_state (
++    state TEXT PRIMARY KEY NOT NULL,
++    organization_id TEXT NOT NULL,
++    nonce TEXT NOT NULL,
++    code_verifier TEXT NOT NULL,
++    redirect_uri TEXT NOT NULL,
++    created_at TEXT NOT NULL,
++    FOREIGN KEY (organization_id) REFERENCES organizations(id) ON DELETE CASCADE
++);
++
++-- ---- SCIM ----
++CREATE TABLE IF NOT EXISTS scim_tokens (
++    id TEXT PRIMARY KEY NOT NULL,
++    organization_id TEXT NOT NULL,
++    token_hash TEXT NOT NULL,               -- SHA-256 of the bearer token
++    created_at TEXT NOT NULL,
++    FOREIGN KEY (organization_id) REFERENCES organizations(id) ON DELETE CASCADE
++);
++CREATE INDEX IF NOT EXISTS idx_scim_tokens_hash ON scim_tokens(token_hash);
 diff --git a/src/handlers/ciphers.rs b/src/handlers/ciphers.rs
-index f155c55..77b487e 100644
+index f155c55..c433c6c 100644
 --- a/src/handlers/ciphers.rs
 +++ b/src/handlers/ciphers.rs
 @@ -64,9 +64,16 @@ pub async fn create_cipher(
@@ -197,7 +415,7 @@ index f155c55..77b487e 100644
      attachments::hydrate_cipher_attachments(&db, env.as_ref(), &mut cipher).await?;
      db::touch_user_updated_at(&db, &claims.sub, &cipher.updated_at).await?;
  
-@@ -123,6 +160,271 @@ pub async fn create_cipher(
+@@ -123,6 +160,303 @@ pub async fn create_cipher(
      Ok(Json(cipher))
  }
  
@@ -267,7 +485,23 @@ index f155c55..77b487e 100644
 +        .first(None)
 +        .await
 +        .map_err(|_| AppError::Database)?;
-+    Ok(row.is_some())
++    if row.is_some() {
++        return Ok(true);
++    }
++    // Access via a group the user belongs to.
++    let grp: Option<CollectionIdRow> = db
++        .prepare(
++            "SELECT cc.cipher_id AS id FROM collection_ciphers cc \
++             JOIN collection_groups cg ON cg.collection_id = cc.collection_id \
++             JOIN group_users gu ON gu.group_id = cg.group_id \
++             JOIN organization_users ou ON ou.id = gu.organization_user_id \
++             WHERE cc.cipher_id = ?1 AND ou.user_id = ?2 AND ou.status = 2",
++        )
++        .bind(&[cipher.id.clone().into(), user_id.to_string().into()])?
++        .first(None)
++        .await
++        .map_err(|_| AppError::Database)?;
++    Ok(grp.is_some())
 +}
 +
 +/// Can the user EDIT this cipher (own it, or org admin, or `manage` on a holding collection)?
@@ -297,7 +531,23 @@ index f155c55..77b487e 100644
 +        .first(None)
 +        .await
 +        .map_err(|_| AppError::Database)?;
-+    Ok(row.is_some())
++    if row.is_some() {
++        return Ok(true);
++    }
++    // Manage via a group with manage rights on a holding collection.
++    let grp: Option<CollectionIdRow> = db
++        .prepare(
++            "SELECT cc.cipher_id AS id FROM collection_ciphers cc \
++             JOIN collection_groups cg ON cg.collection_id = cc.collection_id \
++             JOIN group_users gu ON gu.group_id = cg.group_id \
++             JOIN organization_users ou ON ou.id = gu.organization_user_id \
++             WHERE cc.cipher_id = ?1 AND ou.user_id = ?2 AND ou.status = 2 AND cg.manage = 1",
++        )
++        .bind(&[cipher.id.clone().into(), user_id.to_string().into()])?
++        .first(None)
++        .await
++        .map_err(|_| AppError::Database)?;
++    Ok(grp.is_some())
 +}
 +
 +/// Fetch a cipher the user may READ (personal or accessible org cipher).
@@ -469,7 +719,7 @@ index f155c55..77b487e 100644
  #[worker::send]
  pub async fn update_cipher(
      claims: Claims,
-@@ -134,7 +436,13 @@ pub async fn update_cipher(
+@@ -134,7 +468,13 @@ pub async fn update_cipher(
      let db = db::get_db(&env)?;
      let now = db::now_string();
  
@@ -484,7 +734,7 @@ index f155c55..77b487e 100644
  
      // Validate folder ownership if provided
      if let Some(ref folder_id) = payload.folder_id {
-@@ -179,7 +487,7 @@ pub async fn update_cipher(
+@@ -179,7 +519,7 @@ pub async fn update_cipher(
  
      let mut cipher = Cipher {
          id: id.clone(),
@@ -493,7 +743,7 @@ index f155c55..77b487e 100644
          organization_id: payload.organization_id.clone(),
          r#type: payload.r#type,
          data: data_value,
-@@ -201,7 +509,9 @@ pub async fn update_cipher(
+@@ -201,7 +541,9 @@ pub async fn update_cipher(
  
      d1_query!(
          &db,
@@ -504,7 +754,7 @@ index f155c55..77b487e 100644
          cipher.organization_id,
          cipher.r#type,
          data,
-@@ -280,7 +590,7 @@ pub async fn get_cipher(
+@@ -280,7 +622,7 @@ pub async fn get_cipher(
      Path(id): Path<String>,
  ) -> Result<Json<Cipher>, AppError> {
      let db = db::get_db(&env)?;
@@ -513,7 +763,7 @@ index f155c55..77b487e 100644
      let mut cipher: Cipher = cipher.into();
  
      attachments::hydrate_cipher_attachments(&db, env.as_ref(), &mut cipher).await?;
-@@ -325,7 +635,7 @@ pub async fn update_cipher_partial(
+@@ -325,7 +667,7 @@ pub async fn update_cipher_partial(
      }
  
      // Ensure cipher exists and belongs to user
@@ -522,7 +772,7 @@ index f155c55..77b487e 100644
  
      let now = db::now_string();
  
-@@ -345,7 +655,7 @@ pub async fn update_cipher_partial(
+@@ -345,7 +687,7 @@ pub async fn update_cipher_partial(
      let now = db::now_string();
      db::touch_user_updated_at(&db, user_id, &now).await?;
  
@@ -531,7 +781,7 @@ index f155c55..77b487e 100644
      let mut cipher: Cipher = cipher.into();
  
      attachments::hydrate_cipher_attachments(&db, env.as_ref(), &mut cipher).await?;
-@@ -362,12 +672,12 @@ pub async fn soft_delete_cipher(
+@@ -362,12 +704,12 @@ pub async fn soft_delete_cipher(
      Path(id): Path<String>,
  ) -> Result<Json<()>, AppError> {
      let db = db::get_db(&env)?;
@@ -546,7 +796,7 @@ index f155c55..77b487e 100644
          now,
          id,
          claims.sub
-@@ -436,7 +746,7 @@ pub async fn hard_delete_cipher(
+@@ -436,7 +778,7 @@ pub async fn hard_delete_cipher(
      Path(id): Path<String>,
  ) -> Result<Json<()>, AppError> {
      let db = db::get_db(&env)?;
@@ -555,7 +805,7 @@ index f155c55..77b487e 100644
      let now = db::now_string();
  
      if attachments::attachments_enabled(env.as_ref()) {
-@@ -453,7 +763,7 @@ pub async fn hard_delete_cipher(
+@@ -453,7 +795,7 @@ pub async fn hard_delete_cipher(
  
      d1_query!(
          &db,
@@ -564,7 +814,7 @@ index f155c55..77b487e 100644
          id,
          claims.sub
      )
-@@ -531,13 +841,13 @@ pub async fn restore_cipher(
+@@ -531,13 +873,13 @@ pub async fn restore_cipher(
      Path(id): Path<String>,
  ) -> Result<Json<Cipher>, AppError> {
      let db = db::get_db(&env)?;
@@ -580,7 +830,7 @@ index f155c55..77b487e 100644
          now,
          id,
          claims.sub
-@@ -546,7 +856,7 @@ pub async fn restore_cipher(
+@@ -546,7 +888,7 @@ pub async fn restore_cipher(
      .run()
      .await?;
  
@@ -589,7 +839,61 @@ index f155c55..77b487e 100644
      let mut cipher: Cipher = restored.into();
      attachments::hydrate_cipher_attachments(&db, env.as_ref(), &mut cipher).await?;
  
-@@ -1028,7 +1338,7 @@ fn cipher_json_expr(attachments_enabled: bool) -> String {
+@@ -617,7 +959,7 @@ pub async fn archive_cipher(
+     Path(id): Path<String>,
+ ) -> Result<Json<Cipher>, AppError> {
+     let db = db::get_db(&env)?;
+-    fetch_cipher_for_user(&db, &id, &claims.sub).await.map_err(|_| {
++    fetch_cipher_for_edit(&db, &id, &claims.sub).await.map_err(|_| {
+         AppError::BadRequest(
+             "Cipher was not archived. Ensure the provided ID is correct and you have permission to archive it.".to_string(),
+         )
+@@ -626,7 +968,7 @@ pub async fn archive_cipher(
+ 
+     d1_query!(
+         &db,
+-        "UPDATE ciphers SET archived_at = ?1, updated_at = ?1 WHERE id = ?2 AND user_id = ?3",
++        "UPDATE ciphers SET archived_at = ?1, updated_at = ?1 WHERE id = ?2 AND (user_id = ?3 OR user_id IS NULL)",
+         now,
+         id,
+         claims.sub
+@@ -635,7 +977,7 @@ pub async fn archive_cipher(
+     .run()
+     .await?;
+ 
+-    let updated = fetch_cipher_for_user(&db, &id, &claims.sub).await?;
++    let updated = fetch_cipher_for_read(&db, &id, &claims.sub).await?;
+     let mut cipher: Cipher = updated.into();
+     attachments::hydrate_cipher_attachments(&db, env.as_ref(), &mut cipher).await?;
+ 
+@@ -661,7 +1003,7 @@ pub async fn unarchive_cipher(
+     Path(id): Path<String>,
+ ) -> Result<Json<Cipher>, AppError> {
+     let db = db::get_db(&env)?;
+-    fetch_cipher_for_user(&db, &id, &claims.sub).await.map_err(|_| {
++    fetch_cipher_for_edit(&db, &id, &claims.sub).await.map_err(|_| {
+         AppError::BadRequest(
+             "Cipher was not unarchived. Ensure the provided ID is correct and you have permission to unarchive it.".to_string(),
+         )
+@@ -670,7 +1012,7 @@ pub async fn unarchive_cipher(
+ 
+     d1_query!(
+         &db,
+-        "UPDATE ciphers SET archived_at = NULL, updated_at = ?1 WHERE id = ?2 AND user_id = ?3",
++        "UPDATE ciphers SET archived_at = NULL, updated_at = ?1 WHERE id = ?2 AND (user_id = ?3 OR user_id IS NULL)",
+         now,
+         id,
+         claims.sub
+@@ -679,7 +1021,7 @@ pub async fn unarchive_cipher(
+     .run()
+     .await?;
+ 
+-    let updated = fetch_cipher_for_user(&db, &id, &claims.sub).await?;
++    let updated = fetch_cipher_for_read(&db, &id, &claims.sub).await?;
+     let mut cipher: Cipher = updated.into();
+     attachments::hydrate_cipher_attachments(&db, env.as_ref(), &mut cipher).await?;
+ 
+@@ -1028,7 +1370,7 @@ fn cipher_json_expr(attachments_enabled: bool) -> String {
              'viewPassword', json('true'),
              'permissions', json_object('delete', json('true'), 'restore', json('true')),
              'organizationUseTotp', json('false'),
@@ -598,24 +902,226 @@ index f155c55..77b487e 100644
              'revisionDate', c.updated_at,
              'creationDate', c.created_at,
              'deletedDate', c.deleted_at,
+diff --git a/src/handlers/email.rs b/src/handlers/email.rs
+new file mode 100644
+index 0000000..5d93242
+--- /dev/null
++++ b/src/handlers/email.rs
+@@ -0,0 +1,56 @@
++use worker::{Env, Fetch, Headers, Method, Request, RequestInit};
++
++/// Best-effort outbound invite email.
++///
++/// Cloudflare's free tier can't reliably send arbitrary outbound mail, so invites
++/// work fully without email (manual-confirm). If you want a notification, point these
++/// at any Resend-compatible JSON endpoint:
++///   EMAIL_PROVIDER_URL  e.g. https://api.resend.com/emails
++///   EMAIL_API_KEY       bearer token (set as a Worker secret)
++///   EMAIL_FROM          verified sender address
++/// If any are missing this is a no-op — the invite still succeeds.
++pub async fn send_invite_email(env: &Env, to: &str, org_name: &str) {
++    let url = match env.var("EMAIL_PROVIDER_URL") {
++        Ok(v) => v.to_string(),
++        Err(_) => return,
++    };
++    let api_key = match env
++        .secret("EMAIL_API_KEY")
++        .map(|s| s.to_string())
++        .or_else(|_| env.var("EMAIL_API_KEY").map(|v| v.to_string()))
++    {
++        Ok(v) => v,
++        Err(_) => return,
++    };
++    let from = env
++        .var("EMAIL_FROM")
++        .map(|v| v.to_string())
++        .unwrap_or_else(|_| "no-reply@localhost".to_string());
++
++    let subject = format!("You've been invited to {org_name}");
++    let html = format!(
++        "<p>You've been invited to the <strong>{org_name}</strong> organization.</p>\
++         <p>Open your Bitwarden app, sign in, and accept the invitation. \
++         An administrator will then confirm your access.</p>"
++    );
++    let body = serde_json::json!({
++        "from": from,
++        "to": [to],
++        "subject": subject,
++        "html": html,
++    })
++    .to_string();
++
++    let headers = Headers::new();
++    let _ = headers.set("Authorization", &format!("Bearer {api_key}"));
++    let _ = headers.set("Content-Type", "application/json");
++
++    let mut init = RequestInit::new();
++    init.with_method(Method::Post)
++        .with_headers(headers)
++        .with_body(Some(body.into()));
++
++    if let Ok(req) = Request::new_with_init(&url, &init) {
++        let _ = Fetch::Request(req).send().await;
++    }
++}
+diff --git a/src/handlers/events.rs b/src/handlers/events.rs
+new file mode 100644
+index 0000000..d8c1937
+--- /dev/null
++++ b/src/handlers/events.rs
+@@ -0,0 +1,124 @@
++use axum::extract::{Path, State};
++use axum::Json;
++use serde::Deserialize;
++use serde_json::{json, Value};
++use std::sync::Arc;
++use uuid::Uuid;
++use worker::Env;
++
++use crate::auth::Claims;
++use crate::d1_query;
++use crate::db::{self, Db};
++use crate::error::AppError;
++use crate::handlers::organizations::require_org_manage;
++
++// Bitwarden EventType subset we emit.
++pub const ORG_CREATED: i64 = 1600;
++pub const MEMBER_INVITED: i64 = 1500;
++pub const MEMBER_CONFIRMED: i64 = 1501;
++pub const MEMBER_UPDATED: i64 = 1502;
++pub const MEMBER_REMOVED: i64 = 1503;
++pub const COLLECTION_CREATED: i64 = 1300;
++pub const COLLECTION_DELETED: i64 = 1302;
++pub const GROUP_CREATED: i64 = 1400;
++pub const GROUP_DELETED: i64 = 1402;
++pub const POLICY_UPDATED: i64 = 1700;
++
++/// What an event points at (only one is set).
++pub enum Target<'a> {
++    None,
++    Member(&'a str),
++    Collection(&'a str),
++    Group(&'a str),
++    // Reserved for cipher-level audit events (org admin actions are instrumented today).
++    #[allow(dead_code)]
++    Cipher(&'a str),
++}
++
++/// Append an org event. Best-effort: never fails the caller's operation.
++pub async fn log_event(
++    db: &Db,
++    org_id: &str,
++    event_type: i64,
++    acting_user_id: &str,
++    target: Target<'_>,
++) {
++    let (member, collection, group, cipher) = match target {
++        Target::None => (None, None, None, None),
++        Target::Member(id) => (Some(id), None, None, None),
++        Target::Collection(id) => (None, Some(id), None, None),
++        Target::Group(id) => (None, None, Some(id), None),
++        Target::Cipher(id) => (None, None, None, Some(id)),
++    };
++    let now = db::now_string();
++    let id = Uuid::new_v4().to_string();
++    let stmt = d1_query!(
++        db,
++        "INSERT INTO org_events (id, organization_id, event_type, acting_user_id, member_id, \
++         cipher_id, collection_id, group_id, policy_id, device_type, ip_address, created_at) \
++         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, NULL, NULL, ?9)",
++        id,
++        org_id,
++        event_type,
++        acting_user_id,
++        member,
++        cipher,
++        collection,
++        group,
++        now
++    );
++    if let Ok(stmt) = stmt {
++        let _ = stmt.run().await;
++    }
++}
++
++#[derive(Debug, Deserialize)]
++struct EventRow {
++    event_type: i64,
++    acting_user_id: Option<String>,
++    member_id: Option<String>,
++    cipher_id: Option<String>,
++    collection_id: Option<String>,
++    group_id: Option<String>,
++    created_at: String,
++}
++
++/// GET /api/organizations/{id}/events — recent org audit events (Owner/Admin).
++#[worker::send]
++pub async fn list_events(
++    claims: Claims,
++    State(env): State<Arc<Env>>,
++    Path(org_id): Path<String>,
++) -> Result<Json<Value>, AppError> {
++    let db = db::get_db(&env)?;
++    require_org_manage(&db, &claims.sub, &org_id).await?;
++
++    let rows: Vec<EventRow> = d1_query!(
++        &db,
++        "SELECT event_type, acting_user_id, member_id, cipher_id, collection_id, group_id, created_at \
++         FROM org_events WHERE organization_id = ?1 ORDER BY created_at DESC LIMIT 200",
++        org_id
++    )
++    .map_err(|_| AppError::Database)?
++    .all()
++    .await?
++    .results()
++    .map_err(|_| AppError::Database)?;
++
++    let items: Vec<Value> = rows
++        .into_iter()
++        .map(|r| {
++            json!({
++                "type": r.event_type,
++                "actingUserId": r.acting_user_id,
++                "organizationUserId": r.member_id,
++                "cipherId": r.cipher_id,
++                "collectionId": r.collection_id,
++                "groupId": r.group_id,
++                "date": r.created_at,
++                "object": "event",
++            })
++        })
++        .collect();
++    Ok(Json(json!({ "data": items, "object": "list", "continuationToken": Value::Null })))
++}
 diff --git a/src/handlers/mod.rs b/src/handlers/mod.rs
-index 1c809c6..ab78d9b 100644
+index 1c809c6..b551923 100644
 --- a/src/handlers/mod.rs
 +++ b/src/handlers/mod.rs
-@@ -10,6 +10,7 @@ pub mod folders;
+@@ -5,12 +5,17 @@ pub mod ciphers;
+ pub mod config;
+ pub mod devices;
+ pub mod domains;
++pub mod email;
++pub mod events;
+ pub mod emergency_access;
+ pub mod folders;
  pub mod identity;
  pub mod import;
  pub mod meta;
 +pub mod organizations;
  pub mod purge;
++pub mod scim;
++pub mod sso;
  pub mod sends;
  pub mod streaming;
+ pub mod sync;
 diff --git a/src/handlers/organizations.rs b/src/handlers/organizations.rs
 new file mode 100644
-index 0000000..674b3cf
+index 0000000..04e0d06
 --- /dev/null
 +++ b/src/handlers/organizations.rs
-@@ -0,0 +1,1196 @@
+@@ -0,0 +1,1585 @@
 +use axum::extract::{Path, State};
 +use axum::Json;
 +use serde::Deserialize;
@@ -627,13 +1133,15 @@ index 0000000..674b3cf
 +use crate::auth::Claims;
 +use crate::db::{self, touch_user_updated_at, Db};
 +use crate::error::AppError;
++use crate::handlers::events::{self, Target};
 +use crate::models::organization::{
-+    collection_details, collection_membership, collection_response, org_user_details,
-+    organization_response, profile_organization, AcceptInviteRequest, Collection,
-+    CollectionAccessSelection, ConfirmUserRequest, CreateCollectionRequest,
-+    CreateOrganizationRequest, InviteUsersRequest, Organization, OrganizationUser,
-+    PutCollectionUsersRequest, UpdateOrgUserRequest, UpdateOrganizationRequest, STATUS_ACCEPTED,
-+    STATUS_CONFIRMED, STATUS_INVITED, TYPE_ADMIN, TYPE_OWNER,
++    collection_details, collection_membership, collection_response, group_response,
++    org_user_details, organization_response, policy_response, profile_organization,
++    AcceptInviteRequest, Collection, CollectionAccessSelection, ConfirmUserRequest,
++    CreateCollectionRequest, CreateGroupRequest, CreateOrganizationRequest, Group,
++    InviteUsersRequest, Organization, OrganizationUser, PutCollectionUsersRequest,
++    PutGroupUsersRequest, PutPolicyRequest, UpdateOrgUserRequest, UpdateOrganizationRequest,
++    STATUS_ACCEPTED, STATUS_CONFIRMED, STATUS_INVITED, TYPE_ADMIN, TYPE_OWNER,
 +};
 +use crate::d1_query;
 +
@@ -662,7 +1170,7 @@ index 0000000..674b3cf
 +}
 +
 +/// Require that the user can manage the organization's collections (Owner or Admin).
-+async fn require_org_manage(
++pub async fn require_org_manage(
 +    db: &Db,
 +    user_id: &str,
 +    org_id: &str,
@@ -897,6 +1405,7 @@ index 0000000..674b3cf
 +    }
 +
 +    touch_user_updated_at(&db, &user_id, &now).await?;
++    events::log_event(&db, &org.id, events::ORG_CREATED, &user_id, Target::None).await;
 +
 +    Ok(Json(organization_response(&org, TYPE_OWNER)))
 +}
@@ -1041,6 +1550,7 @@ index 0000000..674b3cf
 +        .await?;
 +    }
 +
++    events::log_event(&db, &col.organization_id, events::COLLECTION_CREATED, &claims.sub, Target::Collection(&col.id)).await;
 +    Ok(Json(collection_response(&col)))
 +}
 +
@@ -1112,6 +1622,7 @@ index 0000000..674b3cf
 +    .run()
 +    .await?;
 +
++    events::log_event(&db, &org_id, events::COLLECTION_DELETED, &claims.sub, Target::Collection(&collection_id)).await;
 +    Ok(Json(()))
 +}
 +
@@ -1129,6 +1640,11 @@ index 0000000..674b3cf
 +struct UserLookupRow {
 +    id: String,
 +    name: Option<String>,
++}
++
++#[derive(Debug, Deserialize)]
++struct OrgNameRow {
++    name: String,
 +}
 +
 +/// Look up an existing account by email (emails are UNIQUE).
@@ -1495,6 +2011,13 @@ index 0000000..674b3cf
 +    } else {
 +        STATUS_INVITED
 +    };
++    // Org name for the optional notification email (best-effort).
++    let org_name = d1_query!(&db, "SELECT name FROM organizations WHERE id = ?1", org_id)
++        .map_err(|_| AppError::Database)?
++        .first::<OrgNameRow>(None)
++        .await?
++        .map(|r| r.name)
++        .unwrap_or_default();
 +
 +    let mut not_found: Vec<String> = Vec::new();
 +    for email in &payload.emails {
@@ -1546,6 +2069,8 @@ index 0000000..674b3cf
 +        .await?;
 +
 +        assign_member_collections(&db, &org_id, &ouid, &payload.collections).await?;
++        events::log_event(&db, &org_id, events::MEMBER_INVITED, &claims.sub, Target::Member(&ouid)).await;
++        crate::handlers::email::send_invite_email(&env, &email, &org_name).await;
 +    }
 +
 +    Ok(Json(json!({
@@ -1609,6 +2134,7 @@ index 0000000..674b3cf
 +    .map_err(|_| AppError::Database)?
 +    .run()
 +    .await?;
++    events::log_event(&db, &org_id, events::MEMBER_CONFIRMED, &claims.sub, Target::Member(&ouid)).await;
 +    Ok(Json(()))
 +}
 +
@@ -1648,6 +2174,7 @@ index 0000000..674b3cf
 +    .await?;
 +
 +    assign_member_collections(&db, &org_id, &ouid, &payload.collections).await?;
++    events::log_event(&db, &org_id, events::MEMBER_UPDATED, &claims.sub, Target::Member(&ouid)).await;
 +    Ok(Json(()))
 +}
 +
@@ -1672,6 +2199,7 @@ index 0000000..674b3cf
 +        .map_err(|_| AppError::Database)?
 +        .run()
 +        .await?;
++    events::log_event(&db, &org_id, events::MEMBER_REMOVED, &claims.sub, Target::Member(&ouid)).await;
 +    Ok(Json(()))
 +}
 +
@@ -1812,8 +2340,1126 @@ index 0000000..674b3cf
 +    }
 +    Ok(Json(()))
 +}
++
++// ============================================================================
++// Groups
++// ============================================================================
++
++/// GET /api/organizations/{id}/groups — list groups (members).
++#[worker::send]
++pub async fn list_groups(
++    claims: Claims,
++    State(env): State<Arc<Env>>,
++    Path(org_id): Path<String>,
++) -> Result<Json<Value>, AppError> {
++    let db = db::get_db(&env)?;
++    require_org_member(&db, &claims.sub, &org_id).await?;
++    let groups: Vec<Group> = d1_query!(
++        &db,
++        "SELECT * FROM groups WHERE organization_id = ?1",
++        org_id
++    )
++    .map_err(|_| AppError::Database)?
++    .all()
++    .await?
++    .results()
++    .map_err(|_| AppError::Database)?;
++    let items: Vec<Value> = groups.iter().map(group_response).collect();
++    Ok(Json(json!({ "data": items, "object": "list", "continuationToken": Value::Null })))
++}
++
++/// Replace a group's collection grants.
++async fn assign_group_collections(
++    db: &Db,
++    org_id: &str,
++    group_id: &str,
++    selections: &[CollectionAccessSelection],
++) -> Result<(), AppError> {
++    d1_query!(db, "DELETE FROM collection_groups WHERE group_id = ?1", group_id)
++        .map_err(|_| AppError::Database)?
++        .run()
++        .await?;
++    for sel in selections {
++        let belongs: Option<IdRow> = d1_query!(
++            db,
++            "SELECT id FROM collections WHERE id = ?1 AND organization_id = ?2",
++            sel.id,
++            org_id
++        )
++        .map_err(|_| AppError::Database)?
++        .first(None)
++        .await?;
++        if belongs.is_none() {
++            continue;
++        }
++        d1_query!(
++            db,
++            "INSERT OR REPLACE INTO collection_groups (collection_id, group_id, read_only, hide_passwords, manage) \
++             VALUES (?1, ?2, ?3, ?4, ?5)",
++            sel.id,
++            group_id,
++            sel.read_only,
++            sel.hide_passwords,
++            sel.manage
++        )
++        .map_err(|_| AppError::Database)?
++        .run()
++        .await?;
++    }
++    Ok(())
++}
++
++/// Replace a group's member list (each id is an org_user id in this org).
++async fn assign_group_users(
++    db: &Db,
++    org_id: &str,
++    group_id: &str,
++    org_user_ids: &[String],
++) -> Result<(), AppError> {
++    d1_query!(db, "DELETE FROM group_users WHERE group_id = ?1", group_id)
++        .map_err(|_| AppError::Database)?
++        .run()
++        .await?;
++    for ouid in org_user_ids {
++        let in_org: Option<IdRow> = d1_query!(
++            db,
++            "SELECT id FROM organization_users WHERE id = ?1 AND organization_id = ?2",
++            ouid,
++            org_id
++        )
++        .map_err(|_| AppError::Database)?
++        .first(None)
++        .await?;
++        if in_org.is_none() {
++            continue;
++        }
++        d1_query!(
++            db,
++            "INSERT OR IGNORE INTO group_users (group_id, organization_user_id) VALUES (?1, ?2)",
++            group_id,
++            ouid
++        )
++        .map_err(|_| AppError::Database)?
++        .run()
++        .await?;
++    }
++    Ok(())
++}
++
++/// POST /api/organizations/{id}/groups — create a group (Owner/Admin).
++#[worker::send]
++pub async fn create_group(
++    claims: Claims,
++    State(env): State<Arc<Env>>,
++    Path(org_id): Path<String>,
++    Json(payload): Json<CreateGroupRequest>,
++) -> Result<Json<Value>, AppError> {
++    let db = db::get_db(&env)?;
++    require_org_manage(&db, &claims.sub, &org_id).await?;
++    let now = db::now_string();
++    let group = Group {
++        id: Uuid::new_v4().to_string(),
++        organization_id: org_id.clone(),
++        name: payload.name,
++        external_id: payload.external_id,
++        created_at: now.clone(),
++        updated_at: now,
++    };
++    d1_query!(
++        &db,
++        "INSERT INTO groups (id, organization_id, name, external_id, created_at, updated_at) \
++         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
++        group.id,
++        group.organization_id,
++        group.name,
++        group.external_id,
++        group.created_at,
++        group.updated_at
++    )
++    .map_err(|_| AppError::Database)?
++    .run()
++    .await?;
++    assign_group_collections(&db, &org_id, &group.id, &payload.collections).await?;
++    assign_group_users(&db, &org_id, &group.id, &payload.users).await?;
++    events::log_event(&db, &org_id, events::GROUP_CREATED, &claims.sub, Target::Group(&group.id)).await;
++    Ok(Json(group_response(&group)))
++}
++
++/// GET /api/organizations/{id}/groups/{gid} — group detail (members).
++#[worker::send]
++pub async fn get_group(
++    claims: Claims,
++    State(env): State<Arc<Env>>,
++    Path((org_id, gid)): Path<(String, String)>,
++) -> Result<Json<Value>, AppError> {
++    let db = db::get_db(&env)?;
++    require_org_member(&db, &claims.sub, &org_id).await?;
++    let group: Group = d1_query!(
++        &db,
++        "SELECT * FROM groups WHERE id = ?1 AND organization_id = ?2",
++        gid,
++        org_id
++    )
++    .map_err(|_| AppError::Database)?
++    .first(None)
++    .await?
++    .ok_or_else(|| AppError::NotFound("Group not found".to_string()))?;
++    Ok(Json(group_response(&group)))
++}
++
++/// PUT /api/organizations/{id}/groups/{gid} — rename + reassign (Owner/Admin).
++#[worker::send]
++pub async fn update_group(
++    claims: Claims,
++    State(env): State<Arc<Env>>,
++    Path((org_id, gid)): Path<(String, String)>,
++    Json(payload): Json<CreateGroupRequest>,
++) -> Result<Json<Value>, AppError> {
++    let db = db::get_db(&env)?;
++    require_org_manage(&db, &claims.sub, &org_id).await?;
++    let now = db::now_string();
++    let existing: Group = d1_query!(
++        &db,
++        "SELECT * FROM groups WHERE id = ?1 AND organization_id = ?2",
++        gid,
++        org_id
++    )
++    .map_err(|_| AppError::Database)?
++    .first(None)
++    .await?
++    .ok_or_else(|| AppError::NotFound("Group not found".to_string()))?;
++    let group = Group {
++        id: existing.id,
++        organization_id: existing.organization_id,
++        name: payload.name,
++        external_id: payload.external_id,
++        created_at: existing.created_at,
++        updated_at: now.clone(),
++    };
++    d1_query!(
++        &db,
++        "UPDATE groups SET name = ?1, external_id = ?2, updated_at = ?3 WHERE id = ?4",
++        group.name,
++        group.external_id,
++        now,
++        group.id
++    )
++    .map_err(|_| AppError::Database)?
++    .run()
++    .await?;
++    assign_group_collections(&db, &org_id, &group.id, &payload.collections).await?;
++    assign_group_users(&db, &org_id, &group.id, &payload.users).await?;
++    Ok(Json(group_response(&group)))
++}
++
++/// DELETE /api/organizations/{id}/groups/{gid} — delete a group (Owner/Admin).
++#[worker::send]
++pub async fn delete_group(
++    claims: Claims,
++    State(env): State<Arc<Env>>,
++    Path((org_id, gid)): Path<(String, String)>,
++) -> Result<Json<()>, AppError> {
++    let db = db::get_db(&env)?;
++    require_org_manage(&db, &claims.sub, &org_id).await?;
++    d1_query!(
++        &db,
++        "DELETE FROM groups WHERE id = ?1 AND organization_id = ?2",
++        gid,
++        org_id
++    )
++    .map_err(|_| AppError::Database)?
++    .run()
++    .await?;
++    events::log_event(&db, &org_id, events::GROUP_DELETED, &claims.sub, Target::Group(&gid)).await;
++    Ok(Json(()))
++}
++
++/// GET /api/organizations/{id}/groups/{gid}/users — the group's member ids.
++#[worker::send]
++pub async fn get_group_users(
++    claims: Claims,
++    State(env): State<Arc<Env>>,
++    Path((org_id, gid)): Path<(String, String)>,
++) -> Result<Json<Value>, AppError> {
++    let db = db::get_db(&env)?;
++    require_org_member(&db, &claims.sub, &org_id).await?;
++    #[derive(Debug, Deserialize)]
++    struct OuRow {
++        organization_user_id: String,
++    }
++    let rows: Vec<OuRow> = d1_query!(
++        &db,
++        "SELECT gu.organization_user_id AS organization_user_id FROM group_users gu \
++         JOIN groups g ON g.id = gu.group_id \
++         WHERE gu.group_id = ?1 AND g.organization_id = ?2",
++        gid,
++        org_id
++    )
++    .map_err(|_| AppError::Database)?
++    .all()
++    .await?
++    .results()
++    .map_err(|_| AppError::Database)?;
++    let ids: Vec<String> = rows.into_iter().map(|r| r.organization_user_id).collect();
++    Ok(Json(json!(ids)))
++}
++
++/// PUT /api/organizations/{id}/groups/{gid}/users — set the group's members (Owner/Admin).
++#[worker::send]
++pub async fn put_group_users(
++    claims: Claims,
++    State(env): State<Arc<Env>>,
++    Path((org_id, gid)): Path<(String, String)>,
++    Json(payload): Json<PutGroupUsersRequest>,
++) -> Result<Json<()>, AppError> {
++    let db = db::get_db(&env)?;
++    require_org_manage(&db, &claims.sub, &org_id).await?;
++    assign_group_users(&db, &org_id, &gid, &payload.group_users).await?;
++    Ok(Json(()))
++}
++
++// ============================================================================
++// Policies
++// ============================================================================
++
++#[derive(Debug, Deserialize)]
++struct PolicyRow {
++    ptype: i64,
++    enabled: i64,
++    data: Option<String>,
++}
++
++/// GET /api/organizations/{id}/policies — all policies (members).
++#[worker::send]
++pub async fn list_policies(
++    claims: Claims,
++    State(env): State<Arc<Env>>,
++    Path(org_id): Path<String>,
++) -> Result<Json<Value>, AppError> {
++    let db = db::get_db(&env)?;
++    require_org_member(&db, &claims.sub, &org_id).await?;
++    let rows: Vec<PolicyRow> = d1_query!(
++        &db,
++        "SELECT ptype, enabled, data FROM org_policies WHERE organization_id = ?1",
++        org_id
++    )
++    .map_err(|_| AppError::Database)?
++    .all()
++    .await?
++    .results()
++    .map_err(|_| AppError::Database)?;
++    let items: Vec<Value> = rows
++        .into_iter()
++        .map(|r| policy_response(&org_id, r.ptype, r.enabled != 0, &r.data))
++        .collect();
++    Ok(Json(json!({ "data": items, "object": "list", "continuationToken": Value::Null })))
++}
++
++/// GET /api/organizations/{id}/policies/{ptype} — one policy (members).
++#[worker::send]
++pub async fn get_policy(
++    claims: Claims,
++    State(env): State<Arc<Env>>,
++    Path((org_id, ptype)): Path<(String, i64)>,
++) -> Result<Json<Value>, AppError> {
++    let db = db::get_db(&env)?;
++    require_org_member(&db, &claims.sub, &org_id).await?;
++    let row: Option<PolicyRow> = d1_query!(
++        &db,
++        "SELECT ptype, enabled, data FROM org_policies WHERE organization_id = ?1 AND ptype = ?2",
++        org_id,
++        ptype
++    )
++    .map_err(|_| AppError::Database)?
++    .first(None)
++    .await?;
++    match row {
++        Some(r) => Ok(Json(policy_response(&org_id, r.ptype, r.enabled != 0, &r.data))),
++        None => Ok(Json(policy_response(&org_id, ptype, false, &None))),
++    }
++}
++
++/// PUT /api/organizations/{id}/policies/{ptype} — upsert a policy (Owner/Admin).
++#[worker::send]
++pub async fn put_policy(
++    claims: Claims,
++    State(env): State<Arc<Env>>,
++    Path((org_id, ptype)): Path<(String, i64)>,
++    Json(payload): Json<PutPolicyRequest>,
++) -> Result<Json<Value>, AppError> {
++    let db = db::get_db(&env)?;
++    require_org_manage(&db, &claims.sub, &org_id).await?;
++    let data_str: Option<String> = payload
++        .data
++        .as_ref()
++        .map(|v| serde_json::to_string(v).unwrap_or_default());
++    d1_query!(
++        &db,
++        "INSERT OR REPLACE INTO org_policies (organization_id, ptype, enabled, data) VALUES (?1, ?2, ?3, ?4)",
++        org_id,
++        ptype,
++        payload.enabled,
++        data_str
++    )
++    .map_err(|_| AppError::Database)?
++    .run()
++    .await?;
++    events::log_event(&db, &org_id, events::POLICY_UPDATED, &claims.sub, Target::None).await;
++    Ok(Json(policy_response(&org_id, ptype, payload.enabled, &data_str)))
++}
+diff --git a/src/handlers/scim.rs b/src/handlers/scim.rs
+new file mode 100644
+index 0000000..ef714af
+--- /dev/null
++++ b/src/handlers/scim.rs
+@@ -0,0 +1,321 @@
++use axum::extract::{Path, State};
++use axum::http::HeaderMap;
++use axum::Json;
++use serde::Deserialize;
++use serde_json::{json, Value};
++use sha2::{Digest, Sha256};
++use std::sync::Arc;
++use uuid::Uuid;
++use worker::Env;
++
++use crate::auth::Claims;
++use crate::crypto;
++use crate::d1_query;
++use crate::db::{self, Db};
++use crate::error::AppError;
++use crate::handlers::organizations::require_org_manage;
++use crate::models::organization::{STATUS_ACCEPTED, STATUS_INVITED, TYPE_USER};
++
++#[derive(Debug, Deserialize)]
++struct IdRow {
++    #[allow(dead_code)]
++    id: String,
++}
++
++fn hash_token(token: &str) -> String {
++    let mut h = Sha256::new();
++    h.update(token.as_bytes());
++    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
++}
++
++/// Verify the `Authorization: Bearer <scim-token>` against the org's SCIM tokens.
++async fn verify_scim(db: &Db, org_id: &str, headers: &HeaderMap) -> Result<(), AppError> {
++    let token = headers
++        .get("authorization")
++        .and_then(|v| v.to_str().ok())
++        .and_then(|s| s.strip_prefix("Bearer "))
++        .ok_or_else(|| AppError::Unauthorized("Missing SCIM token".to_string()))?;
++    let th = hash_token(token);
++    let row: Option<IdRow> = d1_query!(
++        db,
++        "SELECT id FROM scim_tokens WHERE organization_id = ?1 AND token_hash = ?2",
++        org_id,
++        th
++    )
++    .map_err(|_| AppError::Database)?
++    .first(None)
++    .await?;
++    row.map(|_| ())
++        .ok_or_else(|| AppError::Unauthorized("Invalid SCIM token".to_string()))
++}
++
++// ============================================================================
++// SCIM token management (normal Claims auth, Owner/Admin)
++// ============================================================================
++
++/// POST /api/organizations/{id}/scim/tokens — mint a SCIM bearer token (shown once).
++#[worker::send]
++pub async fn create_scim_token(
++    claims: Claims,
++    State(env): State<Arc<Env>>,
++    Path(org_id): Path<String>,
++) -> Result<Json<Value>, AppError> {
++    let db = db::get_db(&env)?;
++    require_org_manage(&db, &claims.sub, &org_id).await?;
++    let token = format!("{}{}", crypto::generate_api_key()?, crypto::generate_api_key()?);
++    let id = Uuid::new_v4().to_string();
++    let now = db::now_string();
++    d1_query!(
++        &db,
++        "INSERT INTO scim_tokens (id, organization_id, token_hash, created_at) VALUES (?1, ?2, ?3, ?4)",
++        id,
++        org_id,
++        hash_token(&token),
++        now
++    )
++    .map_err(|_| AppError::Database)?
++    .run()
++    .await?;
++    // Returned ONCE; only the hash is stored.
++    Ok(Json(json!({ "id": id, "token": token, "object": "scimToken" })))
++}
++
++/// GET /api/organizations/{id}/scim/tokens — list token ids (no secrets).
++#[worker::send]
++pub async fn list_scim_tokens(
++    claims: Claims,
++    State(env): State<Arc<Env>>,
++    Path(org_id): Path<String>,
++) -> Result<Json<Value>, AppError> {
++    let db = db::get_db(&env)?;
++    require_org_manage(&db, &claims.sub, &org_id).await?;
++    #[derive(Debug, Deserialize)]
++    struct Row {
++        id: String,
++        created_at: String,
++    }
++    let rows: Vec<Row> = d1_query!(
++        &db,
++        "SELECT id, created_at FROM scim_tokens WHERE organization_id = ?1",
++        org_id
++    )
++    .map_err(|_| AppError::Database)?
++    .all()
++    .await?
++    .results()
++    .map_err(|_| AppError::Database)?;
++    let items: Vec<Value> = rows
++        .into_iter()
++        .map(|r| json!({ "id": r.id, "createdAt": r.created_at, "object": "scimToken" }))
++        .collect();
++    Ok(Json(json!({ "data": items, "object": "list" })))
++}
++
++/// DELETE /api/organizations/{id}/scim/tokens/{tid} — revoke a SCIM token.
++#[worker::send]
++pub async fn delete_scim_token(
++    claims: Claims,
++    State(env): State<Arc<Env>>,
++    Path((org_id, tid)): Path<(String, String)>,
++) -> Result<Json<()>, AppError> {
++    let db = db::get_db(&env)?;
++    require_org_manage(&db, &claims.sub, &org_id).await?;
++    d1_query!(
++        &db,
++        "DELETE FROM scim_tokens WHERE id = ?1 AND organization_id = ?2",
++        tid,
++        org_id
++    )
++    .map_err(|_| AppError::Database)?
++    .run()
++    .await?;
++    Ok(Json(()))
++}
++
++// ============================================================================
++// SCIM v2 Users (bearer-token auth)
++// ============================================================================
++
++#[derive(Debug, Deserialize)]
++struct ScimUserRow {
++    id: String,
++    email: String,
++    status: i64,
++    name: Option<String>,
++}
++
++fn scim_user(id: &str, email: &str, display_name: &Option<String>, active: bool) -> Value {
++    json!({
++        "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
++        "id": id,
++        "userName": email,
++        "displayName": display_name,
++        "active": active,
++        "emails": [{ "value": email, "primary": true, "type": "work" }],
++        "meta": { "resourceType": "User" },
++    })
++}
++
++/// GET /scim/v2/{org_id}/Users
++#[worker::send]
++pub async fn list_users(
++    State(env): State<Arc<Env>>,
++    Path(org_id): Path<String>,
++    headers: HeaderMap,
++) -> Result<Json<Value>, AppError> {
++    let db = db::get_db(&env)?;
++    verify_scim(&db, &org_id, &headers).await?;
++    let rows: Vec<ScimUserRow> = d1_query!(
++        &db,
++        "SELECT ou.id AS id, ou.email AS email, ou.status AS status, u.name AS name \
++         FROM organization_users ou LEFT JOIN users u ON u.id = ou.user_id \
++         WHERE ou.organization_id = ?1",
++        org_id
++    )
++    .map_err(|_| AppError::Database)?
++    .all()
++    .await?
++    .results()
++    .map_err(|_| AppError::Database)?;
++    let resources: Vec<Value> = rows
++        .iter()
++        .map(|r| scim_user(&r.id, &r.email, &r.name, r.status != STATUS_INVITED))
++        .collect();
++    Ok(Json(json!({
++        "schemas": ["urn:ietf:params:scim:api:messages:2.0:ListResponse"],
++        "totalResults": resources.len(),
++        "Resources": resources,
++        "startIndex": 1,
++        "itemsPerPage": resources.len(),
++    })))
++}
++
++#[derive(Debug, Deserialize)]
++pub struct ScimEmail {
++    value: String,
++}
++
++#[derive(Debug, Deserialize)]
++#[serde(rename_all = "camelCase")]
++pub struct ScimCreateUser {
++    #[serde(default)]
++    user_name: Option<String>,
++    #[serde(default)]
++    emails: Vec<ScimEmail>,
++}
++
++/// POST /scim/v2/{org_id}/Users — provision an existing account into the org.
++#[worker::send]
++pub async fn create_user(
++    State(env): State<Arc<Env>>,
++    Path(org_id): Path<String>,
++    headers: HeaderMap,
++    Json(payload): Json<ScimCreateUser>,
++) -> Result<Json<Value>, AppError> {
++    let db = db::get_db(&env)?;
++    verify_scim(&db, &org_id, &headers).await?;
++
++    let email = payload
++        .user_name
++        .or_else(|| payload.emails.first().map(|e| e.value.clone()))
++        .map(|e| e.trim().to_lowercase())
++        .filter(|e| !e.is_empty())
++        .ok_or_else(|| AppError::BadRequest("userName/email required".to_string()))?;
++
++    #[derive(Debug, Deserialize)]
++    struct U {
++        id: String,
++        name: Option<String>,
++    }
++    let user: Option<U> = d1_query!(&db, "SELECT id, name FROM users WHERE email = ?1", email)
++        .map_err(|_| AppError::Database)?
++        .first(None)
++        .await?;
++    let (user_id, status) = match &user {
++        Some(u) => (Some(u.id.clone()), STATUS_ACCEPTED),
++        None => (None, STATUS_INVITED),
++    };
++
++    // Reuse an existing membership if present.
++    let existing: Option<IdRow> = d1_query!(
++        &db,
++        "SELECT id FROM organization_users WHERE organization_id = ?1 AND email = ?2",
++        org_id,
++        email
++    )
++    .map_err(|_| AppError::Database)?
++    .first(None)
++    .await?;
++    let ouid = match existing {
++        Some(r) => r.id,
++        None => {
++            let ouid = Uuid::new_v4().to_string();
++            let now = db::now_string();
++            d1_query!(
++                &db,
++                "INSERT INTO organization_users (id, organization_id, user_id, email, akey, status, atype, created_at, updated_at) \
++                 VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?8)",
++                ouid,
++                org_id,
++                user_id,
++                email,
++                status,
++                TYPE_USER,
++                now,
++                now
++            )
++            .map_err(|_| AppError::Database)?
++            .run()
++            .await?;
++            ouid
++        }
++    };
++
++    let name = user.and_then(|u| u.name);
++    Ok(Json(scim_user(&ouid, &email, &name, true)))
++}
++
++/// GET /scim/v2/{org_id}/Users/{id}
++#[worker::send]
++pub async fn get_user(
++    State(env): State<Arc<Env>>,
++    Path((org_id, id)): Path<(String, String)>,
++    headers: HeaderMap,
++) -> Result<Json<Value>, AppError> {
++    let db = db::get_db(&env)?;
++    verify_scim(&db, &org_id, &headers).await?;
++    let row: Option<ScimUserRow> = d1_query!(
++        &db,
++        "SELECT ou.id AS id, ou.email AS email, ou.status AS status, u.name AS name \
++         FROM organization_users ou LEFT JOIN users u ON u.id = ou.user_id \
++         WHERE ou.id = ?1 AND ou.organization_id = ?2",
++        id,
++        org_id
++    )
++    .map_err(|_| AppError::Database)?
++    .first(None)
++    .await?;
++    let r = row.ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
++    Ok(Json(scim_user(&r.id, &r.email, &r.name, r.status != STATUS_INVITED)))
++}
++
++/// DELETE /scim/v2/{org_id}/Users/{id} — deprovision (remove the membership).
++#[worker::send]
++pub async fn delete_user(
++    State(env): State<Arc<Env>>,
++    Path((org_id, id)): Path<(String, String)>,
++    headers: HeaderMap,
++) -> Result<Json<()>, AppError> {
++    let db = db::get_db(&env)?;
++    verify_scim(&db, &org_id, &headers).await?;
++    d1_query!(
++        &db,
++        "DELETE FROM organization_users WHERE id = ?1 AND organization_id = ?2",
++        id,
++        org_id
++    )
++    .map_err(|_| AppError::Database)?
++    .run()
++    .await?;
++    Ok(Json(()))
++}
+diff --git a/src/handlers/sso.rs b/src/handlers/sso.rs
+new file mode 100644
+index 0000000..379abb9
+--- /dev/null
++++ b/src/handlers/sso.rs
+@@ -0,0 +1,418 @@
++//! Organization SSO (OIDC).
++//!
++//! STATUS — honest boundary: the SSO *configuration* storage + management endpoints
++//! are complete and safe to use. The login flow (`prevalidate`/`authorize`/`callback`)
++//! is a working OIDC scaffold: it builds the IdP redirect, stores CSRF/nonce state, and
++//! on callback exchanges the code and links the IdP subject to a warden user. It does
++//! NOT yet (a) verify the id_token signature against the IdP JWKS, nor (b) issue
++//! Bitwarden client session tokens via the SSO connector handshake. So SSO is NOT a
++//! production login path yet — it's a configurable, inspectable foundation. Treat the
++//! callback as identity-link verification, not authentication. Documented deliberately
++//! rather than shipped as if finished.
++
++use axum::extract::{Path, Query, State};
++use axum::response::{Html, Redirect};
++use axum::Json;
++use serde::Deserialize;
++use serde_json::{json, Value};
++use std::sync::Arc;
++use uuid::Uuid;
++use worker::{Env, Fetch, Headers, Method, Request, RequestInit};
++
++use crate::auth::Claims;
++use crate::crypto;
++use crate::d1_query;
++use crate::db;
++use crate::error::AppError;
++use crate::handlers::organizations::require_org_manage;
++
++fn base_url(env: &Env) -> String {
++    env.var("BASE_URL")
++        .map(|v| v.to_string())
++        .unwrap_or_default()
++        .trim_end_matches('/')
++        .to_string()
++}
++
++// ============================================================================
++// SSO configuration (Claims auth, Owner/Admin)
++// ============================================================================
++
++#[derive(Debug, Deserialize)]
++#[serde(rename_all = "camelCase")]
++pub struct SsoConfigRequest {
++    pub enabled: bool,
++    #[serde(default)]
++    pub identifier: Option<String>,
++    #[serde(default)]
++    pub authority: Option<String>,
++    #[serde(default)]
++    pub client_id: Option<String>,
++    #[serde(default)]
++    pub client_secret: Option<String>,
++}
++
++#[derive(Debug, Deserialize)]
++struct SsoConfigRow {
++    enabled: i64,
++    identifier: Option<String>,
++    authority: Option<String>,
++    client_id: Option<String>,
++    client_secret: Option<String>,
++}
++
++/// GET /api/organizations/{id}/sso — current SSO config (Owner/Admin). Secret is masked.
++#[worker::send]
++pub async fn get_sso_config(
++    claims: Claims,
++    State(env): State<Arc<Env>>,
++    Path(org_id): Path<String>,
++) -> Result<Json<Value>, AppError> {
++    let db = db::get_db(&env)?;
++    require_org_manage(&db, &claims.sub, &org_id).await?;
++    let row: Option<SsoConfigRow> = d1_query!(
++        &db,
++        "SELECT enabled, identifier, authority, client_id, client_secret FROM org_sso_config WHERE organization_id = ?1",
++        org_id
++    )
++    .map_err(|_| AppError::Database)?
++    .first(None)
++    .await?;
++    let out = match row {
++        Some(r) => json!({
++            "organizationId": org_id,
++            "enabled": r.enabled != 0,
++            "identifier": r.identifier,
++            "authority": r.authority,
++            "clientId": r.client_id,
++            "clientSecretSet": r.client_secret.map(|s| !s.is_empty()).unwrap_or(false),
++            "object": "organizationSsoConfig",
++        }),
++        None => json!({
++            "organizationId": org_id, "enabled": false, "object": "organizationSsoConfig"
++        }),
++    };
++    Ok(Json(out))
++}
++
++/// POST /api/organizations/{id}/sso — upsert SSO config (Owner/Admin).
++#[worker::send]
++pub async fn put_sso_config(
++    claims: Claims,
++    State(env): State<Arc<Env>>,
++    Path(org_id): Path<String>,
++    Json(payload): Json<SsoConfigRequest>,
++) -> Result<Json<Value>, AppError> {
++    let db = db::get_db(&env)?;
++    require_org_manage(&db, &claims.sub, &org_id).await?;
++    let now = db::now_string();
++    d1_query!(
++        &db,
++        "INSERT INTO org_sso_config (organization_id, enabled, identifier, authority, client_id, client_secret, created_at, updated_at) \
++         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7) \
++         ON CONFLICT(organization_id) DO UPDATE SET \
++           enabled = ?2, identifier = ?3, authority = ?4, client_id = ?5, client_secret = ?6, updated_at = ?7",
++        org_id,
++        payload.enabled,
++        payload.identifier,
++        payload.authority,
++        payload.client_id,
++        payload.client_secret,
++        now
++    )
++    .map_err(|_| AppError::Database)?
++    .run()
++    .await?;
++    Ok(Json(json!({ "organizationId": org_id, "enabled": payload.enabled, "object": "organizationSsoConfig" })))
++}
++
++// ============================================================================
++// OIDC login flow (scaffold — see module docs)
++// ============================================================================
++
++#[derive(Debug, Deserialize)]
++pub struct PrevalidateQuery {
++    #[serde(rename = "domainHint", default)]
++    pub domain_hint: Option<String>,
++}
++
++/// GET /sso/prevalidate?domainHint=<identifier> — returns a token the client carries
++/// into the authorize step. (Scaffold: the token is the org identifier.)
++#[worker::send]
++pub async fn prevalidate(
++    State(env): State<Arc<Env>>,
++    Query(q): Query<PrevalidateQuery>,
++) -> Result<Json<Value>, AppError> {
++    let db = db::get_db(&env)?;
++    let identifier = q
++        .domain_hint
++        .ok_or_else(|| AppError::BadRequest("domainHint required".to_string()))?;
++    let row: Option<SsoConfigRow> = d1_query!(
++        &db,
++        "SELECT enabled, identifier, authority, client_id, client_secret FROM org_sso_config WHERE identifier = ?1 AND enabled = 1",
++        identifier
++    )
++    .map_err(|_| AppError::Database)?
++    .first(None)
++    .await?;
++    if row.is_none() {
++        return Err(AppError::NotFound("SSO not configured for that identifier".to_string()));
++    }
++    Ok(Json(json!({ "token": identifier })))
++}
++
++#[derive(Debug, Deserialize)]
++pub struct AuthorizeQuery {
++    pub identifier: String,
++}
++
++/// GET /sso/authorize?identifier=<id> — redirect the browser to the IdP.
++#[worker::send]
++pub async fn authorize(
++    State(env): State<Arc<Env>>,
++    Query(q): Query<AuthorizeQuery>,
++) -> Result<Redirect, AppError> {
++    let db = db::get_db(&env)?;
++    let cfg: SsoConfigRow = d1_query!(
++        &db,
++        "SELECT enabled, identifier, authority, client_id, client_secret FROM org_sso_config WHERE identifier = ?1 AND enabled = 1",
++        q.identifier
++    )
++    .map_err(|_| AppError::Database)?
++    .first(None)
++    .await?
++    .ok_or_else(|| AppError::NotFound("SSO not configured".to_string()))?;
++
++    // Resolve org id for the state row.
++    #[derive(Debug, Deserialize)]
++    struct OrgIdRow {
++        organization_id: String,
++    }
++    let org: OrgIdRow = d1_query!(
++        &db,
++        "SELECT organization_id FROM org_sso_config WHERE identifier = ?1",
++        q.identifier
++    )
++    .map_err(|_| AppError::Database)?
++    .first(None)
++    .await?
++    .ok_or_else(|| AppError::NotFound("SSO org not found".to_string()))?;
++
++    let authority = cfg.authority.unwrap_or_default();
++    let client_id = cfg.client_id.unwrap_or_default();
++    let redirect_uri = format!("{}/sso/callback", base_url(&env));
++    let state = Uuid::new_v4().to_string();
++    let nonce = crypto::generate_api_key()?;
++    let code_verifier = crypto::generate_api_key()?;
++    let now = db::now_string();
++
++    d1_query!(
++        &db,
++        "INSERT INTO sso_login_state (state, organization_id, nonce, code_verifier, redirect_uri, created_at) \
++         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
++        state,
++        org.organization_id,
++        nonce,
++        code_verifier,
++        redirect_uri,
++        now
++    )
++    .map_err(|_| AppError::Database)?
++    .run()
++    .await?;
++
++    // Standard OIDC authorization-code request. (A complete impl would use the IdP's
++    // discovery doc for the exact authorization_endpoint; here we assume `{authority}/authorize`.)
++    let url = format!(
++        "{authority}/authorize?response_type=code&scope=openid%20email%20profile&client_id={client_id}&redirect_uri={redirect_uri}&state={state}&nonce={nonce}",
++        authority = authority.trim_end_matches('/'),
++        redirect_uri = urlencode(&redirect_uri),
++    );
++    Ok(Redirect::temporary(&url))
++}
++
++#[derive(Debug, Deserialize)]
++pub struct CallbackQuery {
++    #[serde(default)]
++    pub code: Option<String>,
++    #[serde(default)]
++    pub state: Option<String>,
++    #[serde(default)]
++    pub error: Option<String>,
++}
++
++#[derive(Debug, Deserialize)]
++struct LoginStateRow {
++    organization_id: String,
++    #[allow(dead_code)]
++    nonce: String,
++    #[allow(dead_code)]
++    code_verifier: String,
++    redirect_uri: String,
++}
++
++/// GET /sso/callback — exchange the code, link the IdP subject to a warden user.
++///
++/// SCAFFOLD: this exchanges the code and reads the id_token claims, but does NOT verify
++/// the id_token signature against the IdP JWKS, and does NOT issue Bitwarden client
++/// tokens. It links the IdP subject to an existing warden account (by email) in
++/// `sso_users` and reports the result. Do not treat this as an authenticated login.
++#[worker::send]
++pub async fn callback(
++    State(env): State<Arc<Env>>,
++    Query(q): Query<CallbackQuery>,
++) -> Result<Html<String>, AppError> {
++    if let Some(err) = q.error {
++        return Ok(Html(format!("<h1>SSO error</h1><p>{}</p>", escape(&err))));
++    }
++    let code = q.code.ok_or_else(|| AppError::BadRequest("missing code".to_string()))?;
++    let state = q.state.ok_or_else(|| AppError::BadRequest("missing state".to_string()))?;
++    let db = db::get_db(&env)?;
++
++    let login: LoginStateRow = d1_query!(
++        &db,
++        "SELECT organization_id, nonce, code_verifier, redirect_uri FROM sso_login_state WHERE state = ?1",
++        state
++    )
++    .map_err(|_| AppError::Database)?
++    .first(None)
++    .await?
++    .ok_or_else(|| AppError::BadRequest("invalid or expired state".to_string()))?;
++    // One-time use.
++    let _ = d1_query!(&db, "DELETE FROM sso_login_state WHERE state = ?1", state)
++        .map_err(|_| AppError::Database)?
++        .run()
++        .await;
++
++    let cfg: SsoConfigRow = d1_query!(
++        &db,
++        "SELECT enabled, identifier, authority, client_id, client_secret FROM org_sso_config WHERE organization_id = ?1",
++        login.organization_id
++    )
++    .map_err(|_| AppError::Database)?
++    .first(None)
++    .await?
++    .ok_or_else(|| AppError::NotFound("SSO config missing".to_string()))?;
++
++    // Exchange the code for tokens at the IdP token endpoint.
++    let id_token = exchange_code(
++        &cfg.authority.clone().unwrap_or_default(),
++        &cfg.client_id.clone().unwrap_or_default(),
++        &cfg.client_secret.clone().unwrap_or_default(),
++        &code,
++        &login.redirect_uri,
++    )
++    .await?;
++
++    // Decode (UNVERIFIED) id_token claims to read sub + email.
++    let claims = decode_jwt_payload(&id_token)
++        .ok_or_else(|| AppError::BadRequest("could not read id_token".to_string()))?;
++    let sub = claims.get("sub").and_then(|v| v.as_str()).unwrap_or("");
++    let email = claims
++        .get("email")
++        .and_then(|v| v.as_str())
++        .unwrap_or("")
++        .to_lowercase();
++    if sub.is_empty() || email.is_empty() {
++        return Ok(Html("<h1>SSO</h1><p>id_token missing sub/email.</p>".to_string()));
++    }
++
++    // Link to an existing account by email (we never auto-create vault accounts).
++    #[derive(Debug, Deserialize)]
++    struct U {
++        id: String,
++    }
++    let user: Option<U> = d1_query!(&db, "SELECT id FROM users WHERE email = ?1", email)
++        .map_err(|_| AppError::Database)?
++        .first(None)
++        .await?;
++    let Some(user) = user else {
++        return Ok(Html(format!(
++            "<h1>SSO verified</h1><p>IdP identity <code>{}</code> verified, but no vault account exists for it yet. Create one first, then link.</p>",
++            escape(&email)
++        )));
++    };
++
++    let now = db::now_string();
++    d1_query!(
++        &db,
++        "INSERT OR REPLACE INTO sso_users (organization_id, external_id, user_id, created_at) VALUES (?1, ?2, ?3, ?4)",
++        login.organization_id,
++        sub,
++        user.id,
++        now
++    )
++    .map_err(|_| AppError::Database)?
++    .run()
++    .await?;
++
++    Ok(Html(format!(
++        "<h1>SSO identity linked</h1><p>Linked IdP subject to the vault account for <code>{}</code>.</p>\
++         <p><em>Note: this scaffold verifies and links identity; it does not yet issue a Bitwarden client session (the connector handshake + id_token signature verification are the remaining work). Sign in with your master password as usual.</em></p>",
++        escape(&email)
++    )))
++}
++
++// ---- helpers ----
++
++async fn exchange_code(
++    authority: &str,
++    client_id: &str,
++    client_secret: &str,
++    code: &str,
++    redirect_uri: &str,
++) -> Result<String, AppError> {
++    let url = format!("{}/token", authority.trim_end_matches('/'));
++    let body = format!(
++        "grant_type=authorization_code&code={}&redirect_uri={}&client_id={}&client_secret={}",
++        urlencode(code),
++        urlencode(redirect_uri),
++        urlencode(client_id),
++        urlencode(client_secret),
++    );
++    let headers = Headers::new();
++    let _ = headers.set("Content-Type", "application/x-www-form-urlencoded");
++    let mut init = RequestInit::new();
++    init.with_method(Method::Post)
++        .with_headers(headers)
++        .with_body(Some(body.into()));
++    let req = Request::new_with_init(&url, &init).map_err(AppError::Worker)?;
++    let mut resp = Fetch::Request(req)
++        .send()
++        .await
++        .map_err(AppError::Worker)?;
++    let text = resp.text().await.map_err(AppError::Worker)?;
++    let json: Value = serde_json::from_str(&text)
++        .map_err(|_| AppError::BadRequest("IdP token response not JSON".to_string()))?;
++    json.get("id_token")
++        .and_then(|v| v.as_str())
++        .map(|s| s.to_string())
++        .ok_or_else(|| AppError::BadRequest("IdP did not return an id_token".to_string()))
++}
++
++/// Decode the (unverified) JWT payload segment into JSON.
++fn decode_jwt_payload(token: &str) -> Option<Value> {
++    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
++    let payload = token.split('.').nth(1)?;
++    let bytes = URL_SAFE_NO_PAD.decode(payload).ok()?;
++    serde_json::from_slice(&bytes).ok()
++}
++
++fn urlencode(s: &str) -> String {
++    let mut out = String::with_capacity(s.len());
++    for b in s.bytes() {
++        match b {
++            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
++                out.push(b as char)
++            }
++            _ => out.push_str(&format!("%{b:02X}")),
++        }
++    }
++    out
++}
++
++fn escape(s: &str) -> String {
++    s.replace('&', "&amp;")
++        .replace('<', "&lt;")
++        .replace('>', "&gt;")
++}
 diff --git a/src/handlers/sync.rs b/src/handlers/sync.rs
-index 50f5452..1fc4b7f 100644
+index 50f5452..2bce783 100644
 --- a/src/handlers/sync.rs
 +++ b/src/handlers/sync.rs
 @@ -7,7 +7,7 @@ use crate::{
@@ -1843,7 +3489,7 @@ index 50f5452..1fc4b7f 100644
      let folders_json = serde_json::to_string(&folders).map_err(|_| AppError::Internal)?;
  
      // Build response JSON via string concatenation (ciphers already raw JSON)
-@@ -123,12 +128,22 @@ pub async fn get_sync_data(
+@@ -123,12 +128,27 @@ pub async fn get_sync_data(
      response.push_str(&profile_json);
      response.push_str(",\"folders\":");
      response.push_str(&folders_json);
@@ -1864,6 +3510,11 @@ index 50f5452..1fc4b7f 100644
 +         OR c.id IN (SELECT cc.cipher_id FROM collection_ciphers cc \
 +                     JOIN collection_users cu ON cu.collection_id = cc.collection_id \
 +                     JOIN organization_users ou ON ou.id = cu.organization_user_id \
++                     WHERE ou.user_id = ?1 AND ou.status = 2) \
++         OR c.id IN (SELECT cc.cipher_id FROM collection_ciphers cc \
++                     JOIN collection_groups cg ON cg.collection_id = cc.collection_id \
++                     JOIN group_users gu ON gu.group_id = cg.group_id \
++                     JOIN organization_users ou ON ou.id = gu.organization_user_id \
 +                     WHERE ou.user_id = ?1 AND ou.status = 2)",
          &[user_id.clone().into()],
          "",
@@ -1900,10 +3551,10 @@ index 9a36d52..f767ae2 100644
  pub mod twofactor;
 diff --git a/src/models/organization.rs b/src/models/organization.rs
 new file mode 100644
-index 0000000..a9d202e
+index 0000000..ed397c3
 --- /dev/null
 +++ b/src/models/organization.rs
-@@ -0,0 +1,331 @@
+@@ -0,0 +1,399 @@
 +use serde::Deserialize;
 +use serde_json::{json, Value};
 +
@@ -2068,6 +3719,74 @@ index 0000000..a9d202e
 +pub struct PutCollectionUsersRequest {
 +    #[serde(default)]
 +    pub users: Vec<CollectionAccessSelection>,
++}
++
++// ---- Groups ----
++
++#[derive(Debug, Deserialize)]
++pub struct Group {
++    pub id: String,
++    pub organization_id: String,
++    pub name: String,
++    pub external_id: Option<String>,
++    #[allow(dead_code)]
++    pub created_at: String,
++    pub updated_at: String,
++}
++
++#[derive(Debug, Deserialize)]
++#[serde(rename_all = "camelCase")]
++pub struct CreateGroupRequest {
++    pub name: String,
++    #[serde(default)]
++    pub external_id: Option<String>,
++    #[serde(default)]
++    pub collections: Vec<CollectionAccessSelection>,
++    /// org_user ids that belong to this group.
++    #[serde(default)]
++    pub users: Vec<String>,
++}
++
++#[derive(Debug, Deserialize)]
++#[serde(rename_all = "camelCase")]
++pub struct PutGroupUsersRequest {
++    #[serde(default)]
++    pub group_users: Vec<String>,
++}
++
++pub fn group_response(g: &Group) -> Value {
++    json!({
++        "id": g.id,
++        "organizationId": g.organization_id,
++        "name": g.name,
++        "externalId": g.external_id,
++        "object": "group",
++    })
++}
++
++// ---- Policies ----
++
++#[derive(Debug, Deserialize)]
++#[serde(rename_all = "camelCase")]
++pub struct PutPolicyRequest {
++    pub enabled: bool,
++    #[serde(default)]
++    pub data: Option<Value>,
++}
++
++pub fn policy_response(organization_id: &str, ptype: i64, enabled: bool, data: &Option<String>) -> Value {
++    let data_val: Value = data
++        .as_deref()
++        .and_then(|s| serde_json::from_str(s).ok())
++        .unwrap_or(Value::Null);
++    json!({
++        "id": format!("{organization_id}-{ptype}"),
++        "organizationId": organization_id,
++        "type": ptype,
++        "enabled": enabled,
++        "data": data_val,
++        "object": "policy",
++    })
 +}
 +
 +// ---- Response builders (Bitwarden-compatible JSON) ----
@@ -2236,19 +3955,20 @@ index 0000000..a9d202e
 +    })
 +}
 diff --git a/src/router.rs b/src/router.rs
-index 5cab746..1152ecb 100644
+index 5cab746..d01dfe7 100644
 --- a/src/router.rs
 +++ b/src/router.rs
-@@ -7,7 +7,7 @@ use worker::Env;
+@@ -7,7 +7,8 @@ use worker::Env;
  
  use crate::handlers::{
      accounts, attachments, auth_requests, ciphers, config, devices, domains, emergency_access,
 -    folders, identity, import, meta, sends, sync, twofactor, webauth,
-+    folders, identity, import, meta, organizations, sends, sync, twofactor, webauth,
++    events, folders, identity, import, meta, organizations, scim, sends, sso, sync, twofactor,
++    webauth,
  };
  
  pub fn api_router(env: Env) -> Router {
-@@ -161,6 +161,17 @@ pub fn api_router(env: Env) -> Router {
+@@ -161,6 +162,17 @@ pub fn api_router(env: Env) -> Router {
              "/api/ciphers/unarchive",
              put(ciphers::unarchive_ciphers_bulk),
          )
@@ -2266,7 +3986,7 @@ index 5cab746..1152ecb 100644
          // Move ciphers to folder
          .route("/api/ciphers/move", post(ciphers::move_cipher_selected))
          .route("/api/ciphers/move", put(ciphers::move_cipher_selected))
-@@ -195,6 +206,80 @@ pub fn api_router(env: Env) -> Router {
+@@ -195,6 +207,135 @@ pub fn api_router(env: Env) -> Router {
              "/api/sends/{send_id}/access/file/{file_id}",
              post(sends::access_file_send),
          )
@@ -2323,6 +4043,61 @@ index 5cab746..1152ecb 100644
 +            "/api/users/{id}/public-key",
 +            get(organizations::get_user_public_key),
 +        )
++        // Groups
++        .route(
++            "/api/organizations/{id}/groups",
++            get(organizations::list_groups).post(organizations::create_group),
++        )
++        .route(
++            "/api/organizations/{id}/groups/{gid}",
++            get(organizations::get_group)
++                .put(organizations::update_group)
++                .delete(organizations::delete_group),
++        )
++        .route(
++            "/api/organizations/{id}/groups/{gid}/users",
++            get(organizations::get_group_users).put(organizations::put_group_users),
++        )
++        // Policies
++        .route(
++            "/api/organizations/{id}/policies",
++            get(organizations::list_policies),
++        )
++        .route(
++            "/api/organizations/{id}/policies/{ptype}",
++            get(organizations::get_policy).put(organizations::put_policy),
++        )
++        // Event logs (audit)
++        .route(
++            "/api/organizations/{id}/events",
++            get(events::list_events),
++        )
++        // SCIM token management (Owner/Admin)
++        .route(
++            "/api/organizations/{id}/scim/tokens",
++            get(scim::list_scim_tokens).post(scim::create_scim_token),
++        )
++        .route(
++            "/api/organizations/{id}/scim/tokens/{tid}",
++            delete(scim::delete_scim_token),
++        )
++        // SCIM v2 provisioning (bearer-token auth)
++        .route(
++            "/scim/v2/{org_id}/Users",
++            get(scim::list_users).post(scim::create_user),
++        )
++        .route(
++            "/scim/v2/{org_id}/Users/{id}",
++            get(scim::get_user).delete(scim::delete_user),
++        )
++        // SSO (OIDC) configuration + login flow
++        .route(
++            "/api/organizations/{id}/sso",
++            get(sso::get_sso_config).post(sso::put_sso_config),
++        )
++        .route("/sso/prevalidate", get(sso::prevalidate))
++        .route("/sso/authorize", get(sso::authorize))
++        .route("/sso/callback", get(sso::callback))
 +        .route(
 +            "/api/organizations/{id}/collections",
 +            get(organizations::list_org_collections),
