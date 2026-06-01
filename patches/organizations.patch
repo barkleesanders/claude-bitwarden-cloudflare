@@ -1074,10 +1074,10 @@ index 0000000..5d93242
 +}
 diff --git a/src/handlers/events.rs b/src/handlers/events.rs
 new file mode 100644
-index 0000000..d8c1937
+index 0000000..73d54a9
 --- /dev/null
 +++ b/src/handlers/events.rs
-@@ -0,0 +1,124 @@
+@@ -0,0 +1,126 @@
 +use axum::extract::{Path, State};
 +use axum::Json;
 +use serde::Deserialize;
@@ -1200,10 +1200,12 @@ index 0000000..d8c1937
 +            })
 +        })
 +        .collect();
-+    Ok(Json(json!({ "data": items, "object": "list", "continuationToken": Value::Null })))
++    Ok(Json(
++        json!({ "data": items, "object": "list", "continuationToken": Value::Null }),
++    ))
 +}
 diff --git a/src/handlers/identity.rs b/src/handlers/identity.rs
-index aed37db..cc21b94 100644
+index aed37db..14aeddf 100644
 --- a/src/handlers/identity.rs
 +++ b/src/handlers/identity.rs
 @@ -89,6 +89,11 @@ pub struct TokenRequest {
@@ -1218,7 +1220,7 @@ index aed37db..cc21b94 100644
  }
  
  #[derive(Debug)]
-@@ -785,6 +790,62 @@ pub async fn token(
+@@ -785,6 +790,65 @@ pub async fn token(
  
              generate_tokens_and_response(user, &device, &device_request.client_id, &env, None)
          }
@@ -1258,7 +1260,10 @@ index aed37db..cc21b94 100644
 +                .map_err(|_| AppError::Unauthorized("invalid_grant".to_string()))?;
 +
 +            let device_request = DeviceAuthRequest {
-+                client_id: payload.client_id.clone().unwrap_or_else(|| "web".to_string()),
++                client_id: payload
++                    .client_id
++                    .clone()
++                    .unwrap_or_else(|| "web".to_string()),
 +                identifier: required_field(
 +                    payload.device_identifier.as_deref(),
 +                    "device_identifier",
@@ -1282,16 +1287,16 @@ index aed37db..cc21b94 100644
      }
  }
 diff --git a/src/handlers/mod.rs b/src/handlers/mod.rs
-index 1c809c6..b551923 100644
+index 1c809c6..2c4fe2c 100644
 --- a/src/handlers/mod.rs
 +++ b/src/handlers/mod.rs
-@@ -5,12 +5,17 @@ pub mod ciphers;
+@@ -5,13 +5,18 @@ pub mod ciphers;
  pub mod config;
  pub mod devices;
  pub mod domains;
 +pub mod email;
-+pub mod events;
  pub mod emergency_access;
++pub mod events;
  pub mod folders;
  pub mod identity;
  pub mod import;
@@ -1299,16 +1304,17 @@ index 1c809c6..b551923 100644
 +pub mod organizations;
  pub mod purge;
 +pub mod scim;
-+pub mod sso;
  pub mod sends;
++pub mod sso;
  pub mod streaming;
  pub mod sync;
+ pub mod twofactor;
 diff --git a/src/handlers/organizations.rs b/src/handlers/organizations.rs
 new file mode 100644
-index 0000000..04e0d06
+index 0000000..9dd7997
 --- /dev/null
 +++ b/src/handlers/organizations.rs
-@@ -0,0 +1,1585 @@
+@@ -0,0 +1,1683 @@
 +use axum::extract::{Path, State};
 +use axum::Json;
 +use serde::Deserialize;
@@ -1318,6 +1324,7 @@ index 0000000..04e0d06
 +use worker::Env;
 +
 +use crate::auth::Claims;
++use crate::d1_query;
 +use crate::db::{self, touch_user_updated_at, Db};
 +use crate::error::AppError;
 +use crate::handlers::events::{self, Target};
@@ -1330,7 +1337,6 @@ index 0000000..04e0d06
 +    PutGroupUsersRequest, PutPolicyRequest, UpdateOrgUserRequest, UpdateOrganizationRequest,
 +    STATUS_ACCEPTED, STATUS_CONFIRMED, STATUS_INVITED, TYPE_ADMIN, TYPE_OWNER,
 +};
-+use crate::d1_query;
 +
 +// ============================================================================
 +// ACL helpers
@@ -1391,10 +1397,7 @@ index 0000000..04e0d06
 +}
 +
 +/// Build the `profile.organizations` array for GET /api/sync.
-+pub async fn build_profile_organizations(
-+    db: &Db,
-+    user_id: &str,
-+) -> Result<Vec<Value>, AppError> {
++pub async fn build_profile_organizations(db: &Db, user_id: &str) -> Result<Vec<Value>, AppError> {
 +    let rows: Vec<ProfileOrgRow> = d1_query!(
 +        db,
 +        "SELECT o.name AS org_name, ou.id AS id, ou.organization_id AS organization_id, \
@@ -1737,7 +1740,14 @@ index 0000000..04e0d06
 +        .await?;
 +    }
 +
-+    events::log_event(&db, &col.organization_id, events::COLLECTION_CREATED, &claims.sub, Target::Collection(&col.id)).await;
++    events::log_event(
++        &db,
++        &col.organization_id,
++        events::COLLECTION_CREATED,
++        &claims.sub,
++        Target::Collection(&col.id),
++    )
++    .await;
 +    Ok(Json(collection_response(&col)))
 +}
 +
@@ -1809,7 +1819,14 @@ index 0000000..04e0d06
 +    .run()
 +    .await?;
 +
-+    events::log_event(&db, &org_id, events::COLLECTION_DELETED, &claims.sub, Target::Collection(&collection_id)).await;
++    events::log_event(
++        &db,
++        &org_id,
++        events::COLLECTION_DELETED,
++        &claims.sub,
++        Target::Collection(&collection_id),
++    )
++    .await;
 +    Ok(Json(()))
 +}
 +
@@ -1914,7 +1931,12 @@ index 0000000..04e0d06
 +    Ok(rows
 +        .into_iter()
 +        .map(|r| {
-+            collection_membership(&r.collection_id, r.read_only != 0, r.hide_passwords != 0, r.manage != 0)
++            collection_membership(
++                &r.collection_id,
++                r.read_only != 0,
++                r.hide_passwords != 0,
++                r.manage != 0,
++            )
 +        })
 +        .collect())
 +}
@@ -1981,7 +2003,9 @@ index 0000000..04e0d06
 +    let db = db::get_db(&env)?;
 +    let member = require_org_member(&db, &claims.sub, &org_id).await?;
 +    if member.atype != TYPE_OWNER {
-+        return Err(AppError::Unauthorized("Only owners can edit the organization".to_string()));
++        return Err(AppError::Unauthorized(
++            "Only owners can edit the organization".to_string(),
++        ));
 +    }
 +    let now = db::now_string();
 +
@@ -2044,7 +2068,9 @@ index 0000000..04e0d06
 +    let db = db::get_db(&env)?;
 +    let member = require_org_member(&db, &claims.sub, &org_id).await?;
 +    if member.atype != TYPE_OWNER {
-+        return Err(AppError::Unauthorized("Only owners can delete the organization".to_string()));
++        return Err(AppError::Unauthorized(
++            "Only owners can delete the organization".to_string(),
++        ));
 +    }
 +
 +    // Org-owned ciphers have no FK to organizations; remove them explicitly.
@@ -2160,10 +2186,12 @@ index 0000000..04e0d06
 +    let member = fetch_membership(&db, &org_id, &ouid).await?;
 +
 +    let name: Option<UserLookupRow> = match &member.user_id {
-+        Some(uid) => d1_query!(&db, "SELECT id, name FROM users WHERE id = ?1", uid)
-+            .map_err(|_| AppError::Database)?
-+            .first(None)
-+            .await?,
++        Some(uid) => {
++            d1_query!(&db, "SELECT id, name FROM users WHERE id = ?1", uid)
++                .map_err(|_| AppError::Database)?
++                .first(None)
++                .await?
++        }
 +        None => None,
 +    };
 +    let collections = member_collections_json(&db, &member.id).await?;
@@ -2256,7 +2284,14 @@ index 0000000..04e0d06
 +        .await?;
 +
 +        assign_member_collections(&db, &org_id, &ouid, &payload.collections).await?;
-+        events::log_event(&db, &org_id, events::MEMBER_INVITED, &claims.sub, Target::Member(&ouid)).await;
++        events::log_event(
++            &db,
++            &org_id,
++            events::MEMBER_INVITED,
++            &claims.sub,
++            Target::Member(&ouid),
++        )
++        .await;
 +        crate::handlers::email::send_invite_email(&env, &email, &org_name).await;
 +    }
 +
@@ -2321,7 +2356,14 @@ index 0000000..04e0d06
 +    .map_err(|_| AppError::Database)?
 +    .run()
 +    .await?;
-+    events::log_event(&db, &org_id, events::MEMBER_CONFIRMED, &claims.sub, Target::Member(&ouid)).await;
++    events::log_event(
++        &db,
++        &org_id,
++        events::MEMBER_CONFIRMED,
++        &claims.sub,
++        Target::Member(&ouid),
++    )
++    .await;
 +    Ok(Json(()))
 +}
 +
@@ -2361,7 +2403,14 @@ index 0000000..04e0d06
 +    .await?;
 +
 +    assign_member_collections(&db, &org_id, &ouid, &payload.collections).await?;
-+    events::log_event(&db, &org_id, events::MEMBER_UPDATED, &claims.sub, Target::Member(&ouid)).await;
++    events::log_event(
++        &db,
++        &org_id,
++        events::MEMBER_UPDATED,
++        &claims.sub,
++        Target::Member(&ouid),
++    )
++    .await;
 +    Ok(Json(()))
 +}
 +
@@ -2382,11 +2431,22 @@ index 0000000..04e0d06
 +        ));
 +    }
 +    // Cascade removes the member's collection_users rows.
-+    d1_query!(&db, "DELETE FROM organization_users WHERE id = ?1", member.id)
-+        .map_err(|_| AppError::Database)?
-+        .run()
-+        .await?;
-+    events::log_event(&db, &org_id, events::MEMBER_REMOVED, &claims.sub, Target::Member(&ouid)).await;
++    d1_query!(
++        &db,
++        "DELETE FROM organization_users WHERE id = ?1",
++        member.id
++    )
++    .map_err(|_| AppError::Database)?
++    .run()
++    .await?;
++    events::log_event(
++        &db,
++        &org_id,
++        events::MEMBER_REMOVED,
++        &claims.sub,
++        Target::Member(&ouid),
++    )
++    .await;
 +    Ok(Json(()))
 +}
 +
@@ -2459,7 +2519,12 @@ index 0000000..04e0d06
 +    let items: Vec<Value> = rows
 +        .into_iter()
 +        .map(|r| {
-+            collection_membership(&r.organization_user_id, r.read_only != 0, r.hide_passwords != 0, r.manage != 0)
++            collection_membership(
++                &r.organization_user_id,
++                r.read_only != 0,
++                r.hide_passwords != 0,
++                r.manage != 0,
++            )
 +        })
 +        .collect();
 +    Ok(Json(json!(items)))
@@ -2552,7 +2617,9 @@ index 0000000..04e0d06
 +    .results()
 +    .map_err(|_| AppError::Database)?;
 +    let items: Vec<Value> = groups.iter().map(group_response).collect();
-+    Ok(Json(json!({ "data": items, "object": "list", "continuationToken": Value::Null })))
++    Ok(Json(
++        json!({ "data": items, "object": "list", "continuationToken": Value::Null }),
++    ))
 +}
 +
 +/// Replace a group's collection grants.
@@ -2562,10 +2629,14 @@ index 0000000..04e0d06
 +    group_id: &str,
 +    selections: &[CollectionAccessSelection],
 +) -> Result<(), AppError> {
-+    d1_query!(db, "DELETE FROM collection_groups WHERE group_id = ?1", group_id)
-+        .map_err(|_| AppError::Database)?
-+        .run()
-+        .await?;
++    d1_query!(
++        db,
++        "DELETE FROM collection_groups WHERE group_id = ?1",
++        group_id
++    )
++    .map_err(|_| AppError::Database)?
++    .run()
++    .await?;
 +    for sel in selections {
 +        let belongs: Option<IdRow> = d1_query!(
 +            db,
@@ -2668,7 +2739,14 @@ index 0000000..04e0d06
 +    .await?;
 +    assign_group_collections(&db, &org_id, &group.id, &payload.collections).await?;
 +    assign_group_users(&db, &org_id, &group.id, &payload.users).await?;
-+    events::log_event(&db, &org_id, events::GROUP_CREATED, &claims.sub, Target::Group(&group.id)).await;
++    events::log_event(
++        &db,
++        &org_id,
++        events::GROUP_CREATED,
++        &claims.sub,
++        Target::Group(&group.id),
++    )
++    .await;
 +    Ok(Json(group_response(&group)))
 +}
 +
@@ -2757,7 +2835,14 @@ index 0000000..04e0d06
 +    .map_err(|_| AppError::Database)?
 +    .run()
 +    .await?;
-+    events::log_event(&db, &org_id, events::GROUP_DELETED, &claims.sub, Target::Group(&gid)).await;
++    events::log_event(
++        &db,
++        &org_id,
++        events::GROUP_DELETED,
++        &claims.sub,
++        Target::Group(&gid),
++    )
++    .await;
 +    Ok(Json(()))
 +}
 +
@@ -2839,7 +2924,9 @@ index 0000000..04e0d06
 +        .into_iter()
 +        .map(|r| policy_response(&org_id, r.ptype, r.enabled != 0, &r.data))
 +        .collect();
-+    Ok(Json(json!({ "data": items, "object": "list", "continuationToken": Value::Null })))
++    Ok(Json(
++        json!({ "data": items, "object": "list", "continuationToken": Value::Null }),
++    ))
 +}
 +
 +/// GET /api/organizations/{id}/policies/{ptype} — one policy (members).
@@ -2861,7 +2948,12 @@ index 0000000..04e0d06
 +    .first(None)
 +    .await?;
 +    match row {
-+        Some(r) => Ok(Json(policy_response(&org_id, r.ptype, r.enabled != 0, &r.data))),
++        Some(r) => Ok(Json(policy_response(
++            &org_id,
++            r.ptype,
++            r.enabled != 0,
++            &r.data,
++        ))),
 +        None => Ok(Json(policy_response(&org_id, ptype, false, &None))),
 +    }
 +}
@@ -2891,15 +2983,27 @@ index 0000000..04e0d06
 +    .map_err(|_| AppError::Database)?
 +    .run()
 +    .await?;
-+    events::log_event(&db, &org_id, events::POLICY_UPDATED, &claims.sub, Target::None).await;
-+    Ok(Json(policy_response(&org_id, ptype, payload.enabled, &data_str)))
++    events::log_event(
++        &db,
++        &org_id,
++        events::POLICY_UPDATED,
++        &claims.sub,
++        Target::None,
++    )
++    .await;
++    Ok(Json(policy_response(
++        &org_id,
++        ptype,
++        payload.enabled,
++        &data_str,
++    )))
 +}
 diff --git a/src/handlers/scim.rs b/src/handlers/scim.rs
 new file mode 100644
-index 0000000..ef714af
+index 0000000..4deebc1
 --- /dev/null
 +++ b/src/handlers/scim.rs
-@@ -0,0 +1,321 @@
+@@ -0,0 +1,332 @@
 +use axum::extract::{Path, State};
 +use axum::http::HeaderMap;
 +use axum::Json;
@@ -2964,7 +3068,11 @@ index 0000000..ef714af
 +) -> Result<Json<Value>, AppError> {
 +    let db = db::get_db(&env)?;
 +    require_org_manage(&db, &claims.sub, &org_id).await?;
-+    let token = format!("{}{}", crypto::generate_api_key()?, crypto::generate_api_key()?);
++    let token = format!(
++        "{}{}",
++        crypto::generate_api_key()?,
++        crypto::generate_api_key()?
++    );
 +    let id = Uuid::new_v4().to_string();
 +    let now = db::now_string();
 +    d1_query!(
@@ -2979,7 +3087,9 @@ index 0000000..ef714af
 +    .run()
 +    .await?;
 +    // Returned ONCE; only the hash is stored.
-+    Ok(Json(json!({ "id": id, "token": token, "object": "scimToken" })))
++    Ok(Json(
++        json!({ "id": id, "token": token, "object": "scimToken" }),
++    ))
 +}
 +
 +/// GET /api/organizations/{id}/scim/tokens — list token ids (no secrets).
@@ -3198,7 +3308,12 @@ index 0000000..ef714af
 +    .first(None)
 +    .await?;
 +    let r = row.ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
-+    Ok(Json(scim_user(&r.id, &r.email, &r.name, r.status != STATUS_INVITED)))
++    Ok(Json(scim_user(
++        &r.id,
++        &r.email,
++        &r.name,
++        r.status != STATUS_INVITED,
++    )))
 +}
 +
 +/// DELETE /scim/v2/{org_id}/Users/{id} — deprovision (remove the membership).
@@ -3223,10 +3338,10 @@ index 0000000..ef714af
 +}
 diff --git a/src/handlers/sso.rs b/src/handlers/sso.rs
 new file mode 100644
-index 0000000..37154b4
+index 0000000..b104647
 --- /dev/null
 +++ b/src/handlers/sso.rs
-@@ -0,0 +1,549 @@
+@@ -0,0 +1,568 @@
 +//! Organization SSO (OIDC).
 +//!
 +//! STATUS — honest boundary: config storage + management are complete. The login flow
@@ -3353,7 +3468,9 @@ index 0000000..37154b4
 +    .map_err(|_| AppError::Database)?
 +    .run()
 +    .await?;
-+    Ok(Json(json!({ "organizationId": org_id, "enabled": payload.enabled, "object": "organizationSsoConfig" })))
++    Ok(Json(
++        json!({ "organizationId": org_id, "enabled": payload.enabled, "object": "organizationSsoConfig" }),
++    ))
 +}
 +
 +// ============================================================================
@@ -3386,7 +3503,9 @@ index 0000000..37154b4
 +    .first(None)
 +    .await?;
 +    if row.is_none() {
-+        return Err(AppError::NotFound("SSO not configured for that identifier".to_string()));
++        return Err(AppError::NotFound(
++            "SSO not configured for that identifier".to_string(),
++        ));
 +    }
 +    Ok(Json(json!({ "token": identifier })))
 +}
@@ -3486,7 +3605,8 @@ index 0000000..37154b4
 +struct LoginStateRow {
 +    organization_id: String,
 +    nonce: String,
-+    #[allow(dead_code)] // reserved for PKCE on the IdP token exchange (IdP-side, separate from client PKCE)
++    #[allow(dead_code)]
++    // reserved for PKCE on the IdP token exchange (IdP-side, separate from client PKCE)
 +    code_verifier: String,
 +    redirect_uri: String,
 +    client_state: Option<String>,
@@ -3509,8 +3629,12 @@ index 0000000..37154b4
 +    if let Some(err) = q.error {
 +        return Ok(Html(format!("<h1>SSO error</h1><p>{}</p>", escape(&err))).into_response());
 +    }
-+    let code = q.code.ok_or_else(|| AppError::BadRequest("missing code".to_string()))?;
-+    let state = q.state.ok_or_else(|| AppError::BadRequest("missing state".to_string()))?;
++    let code = q
++        .code
++        .ok_or_else(|| AppError::BadRequest("missing code".to_string()))?;
++    let state = q
++        .state
++        .ok_or_else(|| AppError::BadRequest("missing state".to_string()))?;
 +    let db = db::get_db(&env)?;
 +
 +    let login: LoginStateRow = d1_query!(
@@ -3564,7 +3688,9 @@ index 0000000..37154b4
 +        .unwrap_or("")
 +        .to_lowercase();
 +    if sub.is_empty() || email.is_empty() {
-+        return Ok(Html("<h1>SSO</h1><p>id_token missing sub/email.</p>".to_string()).into_response());
++        return Ok(
++            Html("<h1>SSO</h1><p>id_token missing sub/email.</p>".to_string()).into_response(),
++        );
 +    }
 +
 +    // Link to an existing account by email (we never auto-create vault accounts).
@@ -3653,10 +3779,7 @@ index 0000000..37154b4
 +        .with_headers(headers)
 +        .with_body(Some(body.into()));
 +    let req = Request::new_with_init(&url, &init).map_err(AppError::Worker)?;
-+    let mut resp = Fetch::Request(req)
-+        .send()
-+        .await
-+        .map_err(AppError::Worker)?;
++    let mut resp = Fetch::Request(req).send().await.map_err(AppError::Worker)?;
 +    let text = resp.text().await.map_err(AppError::Worker)?;
 +    let json: Value = serde_json::from_str(&text)
 +        .map_err(|_| AppError::BadRequest("IdP token response not JSON".to_string()))?;
@@ -3710,7 +3833,10 @@ index 0000000..37154b4
 +        authority.trim_end_matches('/')
 +    ))
 +    .await?;
-+    let issuer = disc.get("issuer").and_then(|v| v.as_str()).unwrap_or(authority);
++    let issuer = disc
++        .get("issuer")
++        .and_then(|v| v.as_str())
++        .unwrap_or(authority);
 +    let jwks_uri = disc
 +        .get("jwks_uri")
 +        .and_then(|v| v.as_str())
@@ -3728,12 +3854,16 @@ index 0000000..37154b4
 +    let signing_input = format!("{}.{}", parts[0], parts[1]);
 +    let valid = crypto::verify_rs256_jwk(jwk, signing_input.as_bytes(), &signature).await?;
 +    if !valid {
-+        return Err(AppError::Unauthorized("id_token signature invalid".to_string()));
++        return Err(AppError::Unauthorized(
++            "id_token signature invalid".to_string(),
++        ));
 +    }
 +
 +    // Claim validation.
 +    if payload.get("iss").and_then(|v| v.as_str()).unwrap_or("") != issuer {
-+        return Err(AppError::Unauthorized("id_token issuer mismatch".to_string()));
++        return Err(AppError::Unauthorized(
++            "id_token issuer mismatch".to_string(),
++        ));
 +    }
 +    let aud_ok = match payload.get("aud") {
 +        Some(Value::String(s)) => s == client_id,
@@ -3741,7 +3871,9 @@ index 0000000..37154b4
 +        _ => false,
 +    };
 +    if !aud_ok {
-+        return Err(AppError::Unauthorized("id_token audience mismatch".to_string()));
++        return Err(AppError::Unauthorized(
++            "id_token audience mismatch".to_string(),
++        ));
 +    }
 +    if let Some(exp) = payload.get("exp").and_then(|v| v.as_i64()) {
 +        if exp < chrono::Utc::now().timestamp() {
@@ -3751,7 +3883,9 @@ index 0000000..37154b4
 +    if !expected_nonce.is_empty() {
 +        if let Some(n) = payload.get("nonce").and_then(|v| v.as_str()) {
 +            if n != expected_nonce {
-+                return Err(AppError::Unauthorized("id_token nonce mismatch".to_string()));
++                return Err(AppError::Unauthorized(
++                    "id_token nonce mismatch".to_string(),
++                ));
 +            }
 +        }
 +    }
@@ -3869,10 +4003,10 @@ index 9a36d52..f767ae2 100644
  pub mod twofactor;
 diff --git a/src/models/organization.rs b/src/models/organization.rs
 new file mode 100644
-index 0000000..ed397c3
+index 0000000..e4dc09a
 --- /dev/null
 +++ b/src/models/organization.rs
-@@ -0,0 +1,399 @@
+@@ -0,0 +1,404 @@
 +use serde::Deserialize;
 +use serde_json::{json, Value};
 +
@@ -4092,7 +4226,12 @@ index 0000000..ed397c3
 +    pub data: Option<Value>,
 +}
 +
-+pub fn policy_response(organization_id: &str, ptype: i64, enabled: bool, data: &Option<String>) -> Value {
++pub fn policy_response(
++    organization_id: &str,
++    ptype: i64,
++    enabled: bool,
++    data: &Option<String>,
++) -> Value {
 +    let data_val: Value = data
 +        .as_deref()
 +        .and_then(|s| serde_json::from_str(s).ok())
@@ -4273,7 +4412,7 @@ index 0000000..ed397c3
 +    })
 +}
 diff --git a/src/router.rs b/src/router.rs
-index 5cab746..d01dfe7 100644
+index 5cab746..f687864 100644
 --- a/src/router.rs
 +++ b/src/router.rs
 @@ -7,7 +7,8 @@ use worker::Env;
@@ -4309,7 +4448,10 @@ index 5cab746..d01dfe7 100644
              post(sends::access_file_send),
          )
 +        // Organizations + shared Collections
-+        .route("/api/organizations", post(organizations::create_organization))
++        .route(
++            "/api/organizations",
++            post(organizations::create_organization),
++        )
 +        .route(
 +            "/api/organizations/{id}",
 +            get(organizations::get_organization)
@@ -4386,10 +4528,7 @@ index 5cab746..d01dfe7 100644
 +            get(organizations::get_policy).put(organizations::put_policy),
 +        )
 +        // Event logs (audit)
-+        .route(
-+            "/api/organizations/{id}/events",
-+            get(events::list_events),
-+        )
++        .route("/api/organizations/{id}/events", get(events::list_events))
 +        // SCIM token management (Owner/Admin)
 +        .route(
 +            "/api/organizations/{id}/scim/tokens",
