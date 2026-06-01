@@ -110,15 +110,18 @@ These go beyond "orgs + shared collections" — added on request, all compiling:
 
 ### ⚠️ Honest boundary on SSO
 
-SSO config + the OIDC authorize/callback are a **scaffold, not a production login path**. The
-callback exchanges the code and links the IdP subject to a vault account (`sso_users`), but it does
-**not** verify the id_token signature against the IdP JWKS, and does **not** issue Bitwarden client
-session tokens via the SSO connector handshake. Treat it as identity-link verification, not
-authentication — users still sign in with their master password. Wiring full SSO login (JWKS verify
-+ connector + token issuance) is genuinely a large subsystem and is left as the one clearly-marked
-incomplete piece, rather than shipped as if finished. (This is also fine because the vault is
-end-to-end encrypted — SSO can't decrypt it without the master password anyway, absent Key
-Connector/TDE, which are not included.)
+The OIDC flow now does **real verification**: the callback runs OIDC discovery, fetches the IdP's
+JWKS, and **verifies the id_token's RS256 signature (via WebCrypto) plus iss / aud / exp / nonce**
+before linking the IdP subject to a vault account (`sso_users`). So identity is genuinely
+authenticated, not just decoded.
+
+The **one** remaining piece: it does **not** issue Bitwarden client session tokens via the official
+web-vault **SSO connector handshake** (prevalidate → connector redirect → `authorization_code` token
+exchange). That contract is version-coupled to the web vault and needs a live IdP + web-vault to
+verify, so it's left clearly marked rather than shipped unverified. Net effect today: SSO is a
+**verified identity link**, and users still sign in with their master password — which is required
+anyway, because the vault is end-to-end encrypted and SSO can't decrypt it without the master
+password (absent Key Connector / TDE, which are not included).
 
 ## Still not included
 

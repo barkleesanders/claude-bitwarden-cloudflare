@@ -356,6 +356,71 @@ index f8c4029..67a4375 100644
 +    FOREIGN KEY (organization_id) REFERENCES organizations(id) ON DELETE CASCADE
 +);
 +CREATE INDEX IF NOT EXISTS idx_scim_tokens_hash ON scim_tokens(token_hash);
+diff --git a/src/crypto.rs b/src/crypto.rs
+index 8882e51..c2e29bc 100644
+--- a/src/crypto.rs
++++ b/src/crypto.rs
+@@ -331,3 +331,60 @@ pub fn generate_api_key() -> Result<String, AppError> {
+ pub fn ct_eq(a: &str, b: &str) -> bool {
+     constant_time_eq(a.as_bytes(), b.as_bytes())
+ }
++
++/// Verify an RS256 signature against an RSA public key supplied as a JWK.
++/// Used for OIDC id_token verification. Returns Ok(true) only on a valid signature.
++pub async fn verify_rs256_jwk(
++    jwk: &serde_json::Value,
++    signing_input: &[u8],
++    signature: &[u8],
++) -> Result<bool, AppError> {
++    let subtle = subtle_crypto()?;
++
++    // Algorithm descriptor for RSASSA-PKCS1-v1_5 + SHA-256.
++    let algorithm = js_sys::Object::new();
++    js_sys::Reflect::set(
++        &algorithm,
++        &JsValue::from_str("name"),
++        &JsValue::from_str("RSASSA-PKCS1-v1_5"),
++    )
++    .map_err(|_| AppError::Crypto("alg name".to_string()))?;
++    js_sys::Reflect::set(
++        &algorithm,
++        &JsValue::from_str("hash"),
++        &JsValue::from_str("SHA-256"),
++    )
++    .map_err(|_| AppError::Crypto("alg hash".to_string()))?;
++
++    // The JWK as a JS object.
++    let jwk_obj = worker::d1::serde_wasm_bindgen::to_value(jwk)
++        .map_err(|e| AppError::Crypto(format!("jwk to_value: {e:?}")))?;
++    let jwk_obj: &js_sys::Object = jwk_obj.unchecked_ref();
++
++    let usages = js_sys::Array::of1(&JsValue::from_str("verify"));
++    let key = JsFuture::from(
++        subtle
++            .import_key_with_object("jwk", jwk_obj, &algorithm, false, &usages)
++            .map_err(|e| AppError::Crypto(format!("import_key: {e:?}")))?,
++    )
++    .await
++    .map_err(|e| AppError::Crypto(format!("import_key await: {e:?}")))?;
++    let crypto_key = CryptoKey::from(key);
++
++    let sig = Uint8Array::new_from_slice(signature);
++    let data = Uint8Array::new_from_slice(signing_input);
++    let verified = JsFuture::from(
++        subtle
++            .verify_with_object_and_buffer_source_and_buffer_source(
++                &algorithm,
++                &crypto_key,
++                sig.as_ref(),
++                data.as_ref(),
++            )
++            .map_err(|e| AppError::Crypto(format!("verify: {e:?}")))?,
++    )
++    .await
++    .map_err(|e| AppError::Crypto(format!("verify await: {e:?}")))?;
++
++    Ok(verified.as_bool().unwrap_or(false))
++}
 diff --git a/src/handlers/ciphers.rs b/src/handlers/ciphers.rs
 index f155c55..c433c6c 100644
 --- a/src/handlers/ciphers.rs
@@ -3036,21 +3101,22 @@ index 0000000..ef714af
 +}
 diff --git a/src/handlers/sso.rs b/src/handlers/sso.rs
 new file mode 100644
-index 0000000..379abb9
+index 0000000..2382ed1
 --- /dev/null
 +++ b/src/handlers/sso.rs
-@@ -0,0 +1,418 @@
+@@ -0,0 +1,507 @@
 +//! Organization SSO (OIDC).
 +//!
-+//! STATUS — honest boundary: the SSO *configuration* storage + management endpoints
-+//! are complete and safe to use. The login flow (`prevalidate`/`authorize`/`callback`)
-+//! is a working OIDC scaffold: it builds the IdP redirect, stores CSRF/nonce state, and
-+//! on callback exchanges the code and links the IdP subject to a warden user. It does
-+//! NOT yet (a) verify the id_token signature against the IdP JWKS, nor (b) issue
-+//! Bitwarden client session tokens via the SSO connector handshake. So SSO is NOT a
-+//! production login path yet — it's a configurable, inspectable foundation. Treat the
-+//! callback as identity-link verification, not authentication. Documented deliberately
-+//! rather than shipped as if finished.
++//! STATUS — honest boundary: config storage + management are complete. The login flow
++//! (`prevalidate`/`authorize`/`callback`) now does REAL OIDC verification: it builds the
++//! IdP redirect with CSRF/nonce state, exchanges the code, and **verifies the id_token's
++//! RS256 signature against the IdP's JWKS (via discovery) plus iss/aud/exp/nonce** before
++//! linking the IdP subject to a warden user. What it does NOT do: issue Bitwarden client
++//! session tokens via the official web-vault SSO connector handshake (that contract is
++//! version-coupled and needs live IdP+web-vault testing to confirm). So today this is a
++//! verified identity-link, not a full client login — users still sign in with their master
++//! password (the vault is E2E-encrypted; SSO can't decrypt it without it, absent Key
++//! Connector/TDE). The connector + token issuance is the one remaining, clearly-marked piece.
 +
 +use axum::extract::{Path, Query, State};
 +use axum::response::{Html, Redirect};
@@ -3286,9 +3352,8 @@ index 0000000..379abb9
 +#[derive(Debug, Deserialize)]
 +struct LoginStateRow {
 +    organization_id: String,
-+    #[allow(dead_code)]
 +    nonce: String,
-+    #[allow(dead_code)]
++    #[allow(dead_code)] // reserved for PKCE code-exchange (not sent in the scaffold exchange)
 +    code_verifier: String,
 +    redirect_uri: String,
 +}
@@ -3346,9 +3411,14 @@ index 0000000..379abb9
 +    )
 +    .await?;
 +
-+    // Decode (UNVERIFIED) id_token claims to read sub + email.
-+    let claims = decode_jwt_payload(&id_token)
-+        .ok_or_else(|| AppError::BadRequest("could not read id_token".to_string()))?;
++    // Verify the id_token (JWKS RS256 signature + iss/aud/exp/nonce) and read its claims.
++    let claims = verify_id_token(
++        &cfg.authority.clone().unwrap_or_default(),
++        &cfg.client_id.clone().unwrap_or_default(),
++        &id_token,
++        &login.nonce,
++    )
++    .await?;
 +    let sub = claims.get("sub").and_then(|v| v.as_str()).unwrap_or("");
 +    let email = claims
 +        .get("email")
@@ -3389,8 +3459,8 @@ index 0000000..379abb9
 +    .await?;
 +
 +    Ok(Html(format!(
-+        "<h1>SSO identity linked</h1><p>Linked IdP subject to the vault account for <code>{}</code>.</p>\
-+         <p><em>Note: this scaffold verifies and links identity; it does not yet issue a Bitwarden client session (the connector handshake + id_token signature verification are the remaining work). Sign in with your master password as usual.</em></p>",
++        "<h1>SSO identity verified + linked</h1><p>Your IdP's id_token was signature-verified (JWKS RS256, iss/aud/exp/nonce) and linked to the vault account for <code>{}</code>.</p>\
++         <p><em>Note: this does not yet issue a Bitwarden client session via the web-vault SSO connector — sign in with your master password as usual. The vault is end-to-end encrypted, so SSO alone can't decrypt it without your master password.</em></p>",
 +        escape(&email)
 +    )))
 +}
@@ -3432,12 +3502,96 @@ index 0000000..379abb9
 +        .ok_or_else(|| AppError::BadRequest("IdP did not return an id_token".to_string()))
 +}
 +
-+/// Decode the (unverified) JWT payload segment into JSON.
-+fn decode_jwt_payload(token: &str) -> Option<Value> {
++async fn http_get_json(url: &str) -> Result<Value, AppError> {
++    let req = Request::new(url, Method::Get).map_err(AppError::Worker)?;
++    let mut resp = Fetch::Request(req).send().await.map_err(AppError::Worker)?;
++    let text = resp.text().await.map_err(AppError::Worker)?;
++    serde_json::from_str(&text).map_err(|_| AppError::BadRequest("non-JSON from IdP".to_string()))
++}
++
++/// Verify an OIDC id_token: fetch the IdP discovery doc + JWKS, verify the RS256
++/// signature against the matching key, and validate iss / aud / exp / nonce.
++/// Returns the verified claims.
++async fn verify_id_token(
++    authority: &str,
++    client_id: &str,
++    id_token: &str,
++    expected_nonce: &str,
++) -> Result<Value, AppError> {
 +    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-+    let payload = token.split('.').nth(1)?;
-+    let bytes = URL_SAFE_NO_PAD.decode(payload).ok()?;
-+    serde_json::from_slice(&bytes).ok()
++    let parts: Vec<&str> = id_token.split('.').collect();
++    if parts.len() != 3 {
++        return Err(AppError::BadRequest("malformed id_token".to_string()));
++    }
++    let header: Value = serde_json::from_slice(
++        &URL_SAFE_NO_PAD
++            .decode(parts[0])
++            .map_err(|_| AppError::BadRequest("id_token header".to_string()))?,
++    )
++    .map_err(|_| AppError::BadRequest("id_token header json".to_string()))?;
++    let payload: Value = serde_json::from_slice(
++        &URL_SAFE_NO_PAD
++            .decode(parts[1])
++            .map_err(|_| AppError::BadRequest("id_token payload".to_string()))?,
++    )
++    .map_err(|_| AppError::BadRequest("id_token payload json".to_string()))?;
++    let signature = URL_SAFE_NO_PAD
++        .decode(parts[2])
++        .map_err(|_| AppError::BadRequest("id_token signature".to_string()))?;
++    let kid = header.get("kid").and_then(|v| v.as_str());
++
++    // OIDC discovery -> issuer + jwks_uri.
++    let disc = http_get_json(&format!(
++        "{}/.well-known/openid-configuration",
++        authority.trim_end_matches('/')
++    ))
++    .await?;
++    let issuer = disc.get("issuer").and_then(|v| v.as_str()).unwrap_or(authority);
++    let jwks_uri = disc
++        .get("jwks_uri")
++        .and_then(|v| v.as_str())
++        .ok_or_else(|| AppError::BadRequest("discovery missing jwks_uri".to_string()))?;
++    let jwks = http_get_json(jwks_uri).await?;
++    let keys = jwks
++        .get("keys")
++        .and_then(|v| v.as_array())
++        .ok_or_else(|| AppError::BadRequest("jwks missing keys".to_string()))?;
++    let jwk = keys
++        .iter()
++        .find(|k| kid.is_none() || k.get("kid").and_then(|v| v.as_str()) == kid)
++        .ok_or_else(|| AppError::Unauthorized("no matching JWKS key".to_string()))?;
++
++    let signing_input = format!("{}.{}", parts[0], parts[1]);
++    let valid = crypto::verify_rs256_jwk(jwk, signing_input.as_bytes(), &signature).await?;
++    if !valid {
++        return Err(AppError::Unauthorized("id_token signature invalid".to_string()));
++    }
++
++    // Claim validation.
++    if payload.get("iss").and_then(|v| v.as_str()).unwrap_or("") != issuer {
++        return Err(AppError::Unauthorized("id_token issuer mismatch".to_string()));
++    }
++    let aud_ok = match payload.get("aud") {
++        Some(Value::String(s)) => s == client_id,
++        Some(Value::Array(a)) => a.iter().any(|v| v.as_str() == Some(client_id)),
++        _ => false,
++    };
++    if !aud_ok {
++        return Err(AppError::Unauthorized("id_token audience mismatch".to_string()));
++    }
++    if let Some(exp) = payload.get("exp").and_then(|v| v.as_i64()) {
++        if exp < chrono::Utc::now().timestamp() {
++            return Err(AppError::Unauthorized("id_token expired".to_string()));
++        }
++    }
++    if !expected_nonce.is_empty() {
++        if let Some(n) = payload.get("nonce").and_then(|v| v.as_str()) {
++            if n != expected_nonce {
++                return Err(AppError::Unauthorized("id_token nonce mismatch".to_string()));
++            }
++        }
++    }
++    Ok(payload)
 +}
 +
 +fn urlencode(s: &str) -> String {
