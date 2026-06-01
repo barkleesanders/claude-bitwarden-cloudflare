@@ -85,13 +85,29 @@ CREATE TABLE IF NOT EXISTS sso_users (
 );
 
 -- Short-lived OIDC login state (CSRF + nonce + PKCE verifier).
+-- client_* columns carry the web vault's own SSO params through the IdP round-trip.
 CREATE TABLE IF NOT EXISTS sso_login_state (
     state TEXT PRIMARY KEY NOT NULL,
     organization_id TEXT NOT NULL,
     nonce TEXT NOT NULL,
     code_verifier TEXT NOT NULL,
     redirect_uri TEXT NOT NULL,
+    client_state TEXT,
+    client_redirect_uri TEXT,
+    client_code_challenge TEXT,
     created_at TEXT NOT NULL,
+    FOREIGN KEY (organization_id) REFERENCES organizations(id) ON DELETE CASCADE
+);
+
+-- One-time Bitwarden SSO authorization codes (issued at callback, redeemed at
+-- /identity/connect/token grant_type=authorization_code).
+CREATE TABLE IF NOT EXISTS sso_auth_codes (
+    code TEXT PRIMARY KEY NOT NULL,
+    user_id TEXT NOT NULL,
+    organization_id TEXT NOT NULL,
+    code_challenge TEXT,                    -- PKCE S256 challenge from the web vault
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
     FOREIGN KEY (organization_id) REFERENCES organizations(id) ON DELETE CASCADE
 );
 

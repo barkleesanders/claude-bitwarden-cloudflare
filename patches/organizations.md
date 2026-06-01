@@ -17,13 +17,21 @@ ACL, which is exactly what D1 + Workers do.
 cd warden-worker
 git apply ../claude-bitwarden-cloudflare/patches/api-key.patch          # if not already applied
 git apply ../claude-bitwarden-cloudflare/patches/organizations.patch
+git apply ../claude-bitwarden-cloudflare/patches/login-hardening.patch  # clear login errors + failed-only rate limit
 cp ../claude-bitwarden-cloudflare/patches/0015_add_organizations.sql migrations/0015_add_organizations.sql
 cp ../claude-bitwarden-cloudflare/patches/0016_add_org_enterprise.sql migrations/0016_add_org_enterprise.sql
 ```
 
-Verified end-to-end: applied to a **fresh clone + api-key.patch**, it `cargo check`s and builds
-with `worker-build --release` from scratch (0 errors, 0 clippy warnings). ~4,400 insertions across
-17 files.
+`login-hardening.patch` (error.rs + identity.rs) makes a failed login return the proper Bitwarden
+error body — so the web vault shows *"Incorrect master password…"* / *"No account is registered
+for `<email>`…"* instead of a generic "unexpected error" — and changes the login rate limiter to
+count **only failed attempts**, so a correct password is never throttled (no self-lockout across
+multiple devices/2FA round-trips). The `sso_auth_codes` table + `client_*` columns the OIDC
+authorization-code grant needs are included in `0016_add_org_enterprise.sql`.
+
+Verified end-to-end against a **fresh upstream clone**: all three patches `git apply` cleanly in
+sequence, and the assembled `src/` tree is byte-for-byte identical to the live, deployed worker
+(0 file diffs). Builds with `worker-build --release` (0 errors, 0 clippy warnings).
 
 > **⚠️ Required `wrangler.toml` change (or `/sso/*` and `/scim/*` will 404 in production).**
 > warden-worker serves non-API paths as static assets. The new SSO + SCIM routes live outside
