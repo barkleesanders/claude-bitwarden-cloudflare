@@ -1,0 +1,251 @@
+diff --git a/sql/schema.sql b/sql/schema.sql
+index a89ae5d..f8c4029 100644
+--- a/sql/schema.sql
++++ b/sql/schema.sql
+@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS users (
+     equivalent_domains TEXT NOT NULL DEFAULT '[]', -- JSON: Vec<Vec<String>>
+     excluded_globals TEXT NOT NULL DEFAULT '[]', -- JSON: Vec<i32> (reserved for future global groups)
+     totp_recover TEXT, -- Recovery code for 2FA
++    api_key TEXT, -- Personal API key (client secret) for `bw login --apikey`
+     created_at TEXT NOT NULL,
+     updated_at TEXT NOT NULL
+ );
+diff --git a/src/crypto.rs b/src/crypto.rs
+index 893feb3..8882e51 100644
+--- a/src/crypto.rs
++++ b/src/crypto.rs
+@@ -316,6 +316,17 @@ pub fn generate_recovery_code() -> Result<String, AppError> {
+     Ok(base32_encode(&bytes.to_vec()))
+ }
+ 
++/// Generates a personal API key / client secret (32 chars, Base32) for `bw login --apikey`.
++pub fn generate_api_key() -> Result<String, AppError> {
++    let crypto = get_crypto()?;
++    let bytes = Uint8Array::new_with_length(20);
++    crypto
++        .get_random_values_with_array_buffer_view(&bytes)
++        .map_err(|e| AppError::Crypto(format!("Failed to generate api key: {:?}", e)))?;
++
++    Ok(base32_encode(&bytes.to_vec()))
++}
++
+ /// Constant-time string comparison wrapper.
+ pub fn ct_eq(a: &str, b: &str) -> bool {
+     constant_time_eq(a.as_bytes(), b.as_bytes())
+diff --git a/src/entry.js b/src/entry.js
+index d6be77d..387e916 100644
+--- a/src/entry.js
++++ b/src/entry.js
+@@ -102,6 +102,10 @@ const HEAVY_DO_ROUTE_METHODS = new Map([
+   // Security stamp rotation requires password verification
+   ["/api/accounts/security-stamp", new Set(["POST"])],
+ 
++  // Personal API key view/rotate verify master password (PBKDF2 — CPU heavy)
++  ["/api/accounts/api-key", new Set(["POST"])],
++  ["/api/accounts/rotate-api-key", new Set(["POST"])],
++
+   // Key rotation needs verify master password and update entire vault
+   ["/api/accounts/key-management/rotate-user-account-keys", new Set(["POST"])],
+ 
+diff --git a/src/handlers/accounts.rs b/src/handlers/accounts.rs
+index 2377523..b960a85 100644
+--- a/src/handlers/accounts.rs
++++ b/src/handlers/accounts.rs
+@@ -270,6 +270,7 @@ pub async fn register(
+         equivalent_domains: "[]".to_string(),
+         excluded_globals: "[]".to_string(),
+         totp_recover: None,
++        api_key: None,
+         created_at: now.clone(),
+         updated_at: now,
+     };
+@@ -611,6 +612,80 @@ pub async fn delete_account(
+     Ok(Json(json!({})))
+ }
+ 
++/// POST /api/accounts/api-key - return the user's personal API key (generating one if absent).
++#[worker::send]
++pub async fn post_api_key(
++    claims: Claims,
++    State(env): State<Arc<Env>>,
++    Json(payload): Json<PasswordOrOtpData>,
++) -> Result<Json<Value>, AppError> {
++    api_key_response(claims, env, payload, false).await
++}
++
++/// POST /api/accounts/rotate-api-key - regenerate the user's personal API key.
++#[worker::send]
++pub async fn rotate_api_key(
++    claims: Claims,
++    State(env): State<Arc<Env>>,
++    Json(payload): Json<PasswordOrOtpData>,
++) -> Result<Json<Value>, AppError> {
++    api_key_response(claims, env, payload, true).await
++}
++
++/// Verify the master password, then return (or rotate) the user's API key.
++async fn api_key_response(
++    claims: Claims,
++    env: Arc<Env>,
++    payload: PasswordOrOtpData,
++    rotate: bool,
++) -> Result<Json<Value>, AppError> {
++    let db = db::get_db(&env)?;
++    let user_id = &claims.sub;
++
++    let user: Value = db
++        .prepare("SELECT * FROM users WHERE id = ?1")
++        .bind(&[user_id.clone().into()])?
++        .first(None)
++        .await
++        .map_err(|_| AppError::Database)?
++        .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
++    let user: User = serde_json::from_value(user).map_err(|_| AppError::Internal)?;
++
++    let provided_hash = payload
++        .master_password_hash
++        .ok_or_else(|| AppError::BadRequest("Missing master password hash".to_string()))?;
++    let verification = user.verify_master_password(&provided_hash).await?;
++    if !verification.is_valid() {
++        return Err(AppError::Unauthorized("Invalid password".to_string()));
++    }
++
++    let api_key = match user.api_key.as_deref() {
++        Some(existing) if !existing.is_empty() && !rotate => existing.to_string(),
++        _ => {
++            let new_key = crate::crypto::generate_api_key()?;
++            let now = db::now_string();
++            d1_query!(
++                &db,
++                "UPDATE users SET api_key = ?1, updated_at = ?2 WHERE id = ?3",
++                &new_key,
++                &now,
++                user_id
++            )
++            .map_err(|_| AppError::Database)?
++            .run()
++            .await
++            .map_err(|_| AppError::Database)?;
++            new_key
++        }
++    };
++
++    Ok(Json(json!({
++        "ApiKey": api_key,
++        "RevisionDate": user.updated_at,
++        "Object": "apiKey"
++    })))
++}
++
+ /// POST /accounts/password - Change master password
+ #[worker::send]
+ pub async fn post_password(
+diff --git a/src/handlers/identity.rs b/src/handlers/identity.rs
+index 7455ce7..aed37db 100644
+--- a/src/handlers/identity.rs
++++ b/src/handlers/identity.rs
+@@ -63,6 +63,8 @@ pub struct TokenRequest {
+     refresh_token: Option<String>,
+     #[serde(rename = "client_id", alias = "clientId")]
+     client_id: Option<String>,
++    #[serde(rename = "client_secret", alias = "clientSecret")]
++    client_secret: Option<String>,
+     scope: Option<String>,
+     #[serde(rename = "authrequest", alias = "authRequest")]
+     auth_request: Option<String>,
+@@ -726,6 +728,63 @@ pub async fn token(
+                 .unwrap_or_else(|| "undefined".to_string());
+             generate_tokens_and_response(user, &device, &client_id, &env, None)
+         }
++        "client_credentials" => {
++            // `bw login --apikey`: client_id = "user.<uuid>", client_secret = personal API key.
++            // No master-password / 2FA check — the API key itself is the credential.
++            let client_id = required_field(payload.client_id.as_deref(), "client_id")?;
++            let user_uuid = client_id
++                .strip_prefix("user.")
++                .filter(|s| !s.is_empty())
++                .ok_or_else(|| AppError::BadRequest("Invalid client_id".to_string()))?;
++            let client_secret = required_field(payload.client_secret.as_deref(), "client_secret")?;
++
++            // Rate-limit api-key auth by user id to prevent brute force.
++            if let Ok(rate_limiter) = env.rate_limiter("LOGIN_RATE_LIMITER") {
++                let rate_limit_key = format!("apikey:{user_uuid}");
++                if let Ok(outcome) = rate_limiter.limit(rate_limit_key).await {
++                    if !outcome.success {
++                        return Err(AppError::TooManyRequests(
++                            "Too many login attempts. Please try again later.".to_string(),
++                        ));
++                    }
++                }
++            }
++
++            let user = load_user_by_id(&db, user_uuid)
++                .await
++                .map_err(|_| AppError::Unauthorized("Invalid credentials".to_string()))?;
++
++            let stored = user
++                .api_key
++                .as_deref()
++                .filter(|k| !k.is_empty())
++                .ok_or_else(|| AppError::Unauthorized("Invalid credentials".to_string()))?;
++            if !ct_eq(stored, &client_secret) {
++                return Err(AppError::Unauthorized("Invalid credentials".to_string()));
++            }
++
++            let device_request = DeviceAuthRequest {
++                client_id: client_id.clone(),
++                identifier: required_field(
++                    payload.device_identifier.as_deref(),
++                    "device_identifier",
++                )?,
++                name: required_field(payload.device_name.as_deref(), "device_name")?,
++                r#type: parse_required_device_type(payload.device_type.as_deref(), "device_type")?,
++            };
++
++            let mut device = Device::get_or_create(
++                &db,
++                device_request.identifier,
++                user.id.clone(),
++                device_request.name,
++                device_request.r#type,
++            )
++            .await?;
++            device.touch(&db).await?;
++
++            generate_tokens_and_response(user, &device, &device_request.client_id, &env, None)
++        }
+         _ => Err(AppError::BadRequest("Unsupported grant_type".to_string())),
+     }
+ }
+diff --git a/src/models/user.rs b/src/models/user.rs
+index 3b2b18f..116a029 100644
+--- a/src/models/user.rs
++++ b/src/models/user.rs
+@@ -36,6 +36,9 @@ pub struct User {
+     #[serde(default = "default_json_array_string")]
+     pub excluded_globals: String,
+     pub totp_recover: Option<String>, // Recovery code for 2FA
++    /// Personal API key (client secret) for `bw login --apikey`. Never serialized out.
++    #[serde(default, skip_serializing)]
++    pub api_key: Option<String>,
+     pub created_at: String,
+     pub updated_at: String,
+ }
+diff --git a/src/router.rs b/src/router.rs
+index a6130c1..5cab746 100644
+--- a/src/router.rs
++++ b/src/router.rs
+@@ -49,6 +49,12 @@ pub fn api_router(env: Env) -> Router {
+         .route("/api/accounts/password", post(accounts::post_password))
+         // Log out all sessions via security stamp rotation
+         .route("/api/accounts/security-stamp", post(accounts::post_sstamp))
++        // Personal API key (bw login --apikey)
++        .route("/api/accounts/api-key", post(accounts::post_api_key))
++        .route(
++            "/api/accounts/rotate-api-key",
++            post(accounts::rotate_api_key),
++        )
+         // Rotate encryption keys
+         .route(
+             "/api/accounts/key-management/rotate-user-account-keys",
+
