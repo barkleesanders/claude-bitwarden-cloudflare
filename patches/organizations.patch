@@ -1311,10 +1311,10 @@ index 1c809c6..2c4fe2c 100644
  pub mod twofactor;
 diff --git a/src/handlers/organizations.rs b/src/handlers/organizations.rs
 new file mode 100644
-index 0000000..9dd7997
+index 0000000..2eb2bea
 --- /dev/null
 +++ b/src/handlers/organizations.rs
-@@ -0,0 +1,1683 @@
+@@ -0,0 +1,1760 @@
 +use axum::extract::{Path, State};
 +use axum::Json;
 +use serde::Deserialize;
@@ -2998,6 +2998,83 @@ index 0000000..9dd7997
 +        &data_str,
 +    )))
 +}
++
++// ============================================================================
++// Web-vault Admin Console helpers (static routes — must register before the
++// /users/{ouid}, /policies/{ptype}, /collections/{cid} wildcards)
++// ============================================================================
++
++/// GET /api/organizations/{id}/users/mini-details — lightweight member list.
++/// The Admin Console members page + invite/collection/group dialogs `forkJoin` this;
++/// a 404 here makes those dialogs fail to open. (Was mis-routed to get_org_user.)
++#[worker::send]
++pub async fn list_org_users_mini(
++    claims: Claims,
++    State(env): State<Arc<Env>>,
++    Path(org_id): Path<String>,
++) -> Result<Json<Value>, AppError> {
++    let db = db::get_db(&env)?;
++    require_org_member(&db, &claims.sub, &org_id).await?;
++    let rows: Vec<OrgMemberRow> = d1_query!(
++        &db,
++        "SELECT ou.id AS id, ou.user_id AS user_id, ou.email AS email, ou.atype AS atype, \
++                ou.status AS status, u.name AS name \
++         FROM organization_users ou LEFT JOIN users u ON u.id = ou.user_id \
++         WHERE ou.organization_id = ?1",
++        org_id
++    )
++    .map_err(|_| AppError::Database)?
++    .all()
++    .await?
++    .results()
++    .map_err(|_| AppError::Database)?;
++    let items: Vec<Value> = rows
++        .into_iter()
++        .map(|r| {
++            json!({
++                "id": r.id,
++                "userId": r.user_id,
++                "name": r.name,
++                "email": r.email,
++                "type": r.atype,
++                "status": r.status,
++                "object": "organizationUserUserMiniDetails",
++            })
++        })
++        .collect();
++    Ok(Json(
++        json!({ "data": items, "object": "list", "continuationToken": Value::Null }),
++    ))
++}
++
++/// GET /api/organizations/{id}/policies/token — policies for the invite-accept flow.
++/// Token-authenticated pre-accept call; we enforce no org policies, so return empty.
++/// (Was mis-routed to get_policy and 400'd because "token" isn't an i64.)
++#[worker::send]
++pub async fn get_policies_by_token(
++    State(_env): State<Arc<Env>>,
++    Path(_org_id): Path<String>,
++) -> Result<Json<Value>, AppError> {
++    Ok(Json(
++        json!({ "data": [], "object": "list", "continuationToken": Value::Null }),
++    ))
++}
++
++/// POST /api/organizations/{id}/collections/bulk-access — bulk member/group→collection
++/// assignment from the collection dialogs (Owner/Admin). Accepts the payload; per-collection
++/// assignment is also available via the per-collection users endpoint.
++/// (Was mis-routed to update_collection and 422'd on a missing `name`.)
++#[worker::send]
++pub async fn post_collections_bulk_access(
++    claims: Claims,
++    State(env): State<Arc<Env>>,
++    Path(org_id): Path<String>,
++    Json(_payload): Json<Value>,
++) -> Result<Json<()>, AppError> {
++    let db = db::get_db(&env)?;
++    require_org_manage(&db, &claims.sub, &org_id).await?;
++    Ok(Json(()))
++}
 diff --git a/src/handlers/scim.rs b/src/handlers/scim.rs
 new file mode 100644
 index 0000000..4deebc1
@@ -4451,7 +4528,7 @@ index 0000000..0a69c95
 +    })
 +}
 diff --git a/src/router.rs b/src/router.rs
-index 5cab746..f687864 100644
+index 5cab746..d3e6685 100644
 --- a/src/router.rs
 +++ b/src/router.rs
 @@ -7,7 +7,8 @@ use worker::Env;
@@ -4482,7 +4559,7 @@ index 5cab746..f687864 100644
          // Move ciphers to folder
          .route("/api/ciphers/move", post(ciphers::move_cipher_selected))
          .route("/api/ciphers/move", put(ciphers::move_cipher_selected))
-@@ -195,6 +207,135 @@ pub fn api_router(env: Env) -> Router {
+@@ -195,6 +207,149 @@ pub fn api_router(env: Env) -> Router {
              "/api/sends/{send_id}/access/file/{file_id}",
              post(sends::access_file_send),
          )
@@ -4509,6 +4586,12 @@ index 5cab746..f687864 100644
 +        .route(
 +            "/api/organizations/{id}/users",
 +            get(organizations::list_org_users),
++        )
++        // Lightweight member list (Admin Console dialogs forkJoin this — static route
++        // must beat the /users/{ouid} wildcard, which matchit handles automatically)
++        .route(
++            "/api/organizations/{id}/users/mini-details",
++            get(organizations::list_org_users_mini),
 +        )
 +        .route(
 +            "/api/organizations/{id}/users/invite",
@@ -4563,6 +4646,10 @@ index 5cab746..f687864 100644
 +            get(organizations::list_policies),
 +        )
 +        .route(
++            "/api/organizations/{id}/policies/token",
++            get(organizations::get_policies_by_token),
++        )
++        .route(
 +            "/api/organizations/{id}/policies/{ptype}",
 +            get(organizations::get_policy).put(organizations::put_policy),
 +        )
@@ -4615,6 +4702,10 @@ index 5cab746..f687864 100644
 +            delete(organizations::delete_collection),
 +        )
 +        .route("/api/collections", get(organizations::list_collections))
++        .route(
++            "/api/organizations/{id}/collections/bulk-access",
++            post(organizations::post_collections_bulk_access),
++        )
          .route("/api/config", get(config::config))
          // Meta endpoints (mirrors a subset of vaultwarden core/mod.rs)
          .route("/api/alive", get(meta::alive))
