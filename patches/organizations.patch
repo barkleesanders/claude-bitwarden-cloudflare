@@ -465,9 +465,16 @@ index 8882e51..df2a8ba 100644
 +    Ok(verified.as_bool().unwrap_or(false))
 +}
 diff --git a/src/handlers/ciphers.rs b/src/handlers/ciphers.rs
-index f155c55..c433c6c 100644
+index f155c55..5002e7e 100644
 --- a/src/handlers/ciphers.rs
 +++ b/src/handlers/ciphers.rs
+@@ -1,5 +1,5 @@
+ use crate::d1_query;
+-use axum::extract::Path;
++use axum::extract::{Path, Query};
+ use axum::http::header;
+ use axum::response::{IntoResponse, Response};
+ use axum::{extract::State, Extension, Json};
 @@ -64,9 +64,16 @@ pub async fn create_cipher(
  
      let data_value = serde_json::to_value(&cipher_data).map_err(|_| AppError::Internal)?;
@@ -862,7 +869,42 @@ index f155c55..c433c6c 100644
          cipher.organization_id,
          cipher.r#type,
          data,
-@@ -280,7 +622,7 @@ pub async fn get_cipher(
+@@ -272,6 +614,34 @@ pub async fn list_ciphers(
+     .await
+ }
+ 
++#[derive(Debug, Deserialize)]
++pub struct OrgCipherQuery {
++    #[serde(rename = "organizationId")]
++    pub organization_id: String,
++}
++
++/// GET /api/ciphers/organization-details?organizationId={id} — all ciphers in an org
++/// (Admin Console items view). The members page loads this on mount; a 404 leaves the
++/// org-admin component broken so the Invite dialog can't open.
++#[worker::send]
++pub async fn organization_cipher_details(
++    claims: Claims,
++    State(env): State<Arc<Env>>,
++    Query(q): Query<OrgCipherQuery>,
++) -> Result<RawJson, AppError> {
++    let db = db::get_db(&env)?;
++    crate::handlers::organizations::require_org_member(&db, &claims.sub, &q.organization_id)
++        .await?;
++    build_cipher_list_response(
++        &db,
++        env.as_ref(),
++        "WHERE c.organization_id = ?1",
++        &[q.organization_id.clone().into()],
++        "ORDER BY c.updated_at DESC",
++    )
++    .await
++}
++
+ /// GET /api/ciphers/{id}
+ #[worker::send]
+ pub async fn get_cipher(
+@@ -280,7 +650,7 @@ pub async fn get_cipher(
      Path(id): Path<String>,
  ) -> Result<Json<Cipher>, AppError> {
      let db = db::get_db(&env)?;
@@ -871,7 +913,7 @@ index f155c55..c433c6c 100644
      let mut cipher: Cipher = cipher.into();
  
      attachments::hydrate_cipher_attachments(&db, env.as_ref(), &mut cipher).await?;
-@@ -325,7 +667,7 @@ pub async fn update_cipher_partial(
+@@ -325,7 +695,7 @@ pub async fn update_cipher_partial(
      }
  
      // Ensure cipher exists and belongs to user
@@ -880,7 +922,7 @@ index f155c55..c433c6c 100644
  
      let now = db::now_string();
  
-@@ -345,7 +687,7 @@ pub async fn update_cipher_partial(
+@@ -345,7 +715,7 @@ pub async fn update_cipher_partial(
      let now = db::now_string();
      db::touch_user_updated_at(&db, user_id, &now).await?;
  
@@ -889,7 +931,7 @@ index f155c55..c433c6c 100644
      let mut cipher: Cipher = cipher.into();
  
      attachments::hydrate_cipher_attachments(&db, env.as_ref(), &mut cipher).await?;
-@@ -362,12 +704,12 @@ pub async fn soft_delete_cipher(
+@@ -362,12 +732,12 @@ pub async fn soft_delete_cipher(
      Path(id): Path<String>,
  ) -> Result<Json<()>, AppError> {
      let db = db::get_db(&env)?;
@@ -904,7 +946,7 @@ index f155c55..c433c6c 100644
          now,
          id,
          claims.sub
-@@ -436,7 +778,7 @@ pub async fn hard_delete_cipher(
+@@ -436,7 +806,7 @@ pub async fn hard_delete_cipher(
      Path(id): Path<String>,
  ) -> Result<Json<()>, AppError> {
      let db = db::get_db(&env)?;
@@ -913,7 +955,7 @@ index f155c55..c433c6c 100644
      let now = db::now_string();
  
      if attachments::attachments_enabled(env.as_ref()) {
-@@ -453,7 +795,7 @@ pub async fn hard_delete_cipher(
+@@ -453,7 +823,7 @@ pub async fn hard_delete_cipher(
  
      d1_query!(
          &db,
@@ -922,7 +964,7 @@ index f155c55..c433c6c 100644
          id,
          claims.sub
      )
-@@ -531,13 +873,13 @@ pub async fn restore_cipher(
+@@ -531,13 +901,13 @@ pub async fn restore_cipher(
      Path(id): Path<String>,
  ) -> Result<Json<Cipher>, AppError> {
      let db = db::get_db(&env)?;
@@ -938,7 +980,7 @@ index f155c55..c433c6c 100644
          now,
          id,
          claims.sub
-@@ -546,7 +888,7 @@ pub async fn restore_cipher(
+@@ -546,7 +916,7 @@ pub async fn restore_cipher(
      .run()
      .await?;
  
@@ -947,7 +989,7 @@ index f155c55..c433c6c 100644
      let mut cipher: Cipher = restored.into();
      attachments::hydrate_cipher_attachments(&db, env.as_ref(), &mut cipher).await?;
  
-@@ -617,7 +959,7 @@ pub async fn archive_cipher(
+@@ -617,7 +987,7 @@ pub async fn archive_cipher(
      Path(id): Path<String>,
  ) -> Result<Json<Cipher>, AppError> {
      let db = db::get_db(&env)?;
@@ -956,7 +998,7 @@ index f155c55..c433c6c 100644
          AppError::BadRequest(
              "Cipher was not archived. Ensure the provided ID is correct and you have permission to archive it.".to_string(),
          )
-@@ -626,7 +968,7 @@ pub async fn archive_cipher(
+@@ -626,7 +996,7 @@ pub async fn archive_cipher(
  
      d1_query!(
          &db,
@@ -965,7 +1007,7 @@ index f155c55..c433c6c 100644
          now,
          id,
          claims.sub
-@@ -635,7 +977,7 @@ pub async fn archive_cipher(
+@@ -635,7 +1005,7 @@ pub async fn archive_cipher(
      .run()
      .await?;
  
@@ -974,7 +1016,7 @@ index f155c55..c433c6c 100644
      let mut cipher: Cipher = updated.into();
      attachments::hydrate_cipher_attachments(&db, env.as_ref(), &mut cipher).await?;
  
-@@ -661,7 +1003,7 @@ pub async fn unarchive_cipher(
+@@ -661,7 +1031,7 @@ pub async fn unarchive_cipher(
      Path(id): Path<String>,
  ) -> Result<Json<Cipher>, AppError> {
      let db = db::get_db(&env)?;
@@ -983,7 +1025,7 @@ index f155c55..c433c6c 100644
          AppError::BadRequest(
              "Cipher was not unarchived. Ensure the provided ID is correct and you have permission to unarchive it.".to_string(),
          )
-@@ -670,7 +1012,7 @@ pub async fn unarchive_cipher(
+@@ -670,7 +1040,7 @@ pub async fn unarchive_cipher(
  
      d1_query!(
          &db,
@@ -992,7 +1034,7 @@ index f155c55..c433c6c 100644
          now,
          id,
          claims.sub
-@@ -679,7 +1021,7 @@ pub async fn unarchive_cipher(
+@@ -679,7 +1049,7 @@ pub async fn unarchive_cipher(
      .run()
      .await?;
  
@@ -1001,7 +1043,7 @@ index f155c55..c433c6c 100644
      let mut cipher: Cipher = updated.into();
      attachments::hydrate_cipher_attachments(&db, env.as_ref(), &mut cipher).await?;
  
-@@ -1028,7 +1370,7 @@ fn cipher_json_expr(attachments_enabled: bool) -> String {
+@@ -1028,7 +1398,7 @@ fn cipher_json_expr(attachments_enabled: bool) -> String {
              'viewPassword', json('true'),
              'permissions', json_object('delete', json('true'), 'restore', json('true')),
              'organizationUseTotp', json('false'),
@@ -1311,10 +1353,10 @@ index 1c809c6..2c4fe2c 100644
  pub mod twofactor;
 diff --git a/src/handlers/organizations.rs b/src/handlers/organizations.rs
 new file mode 100644
-index 0000000..2eb2bea
+index 0000000..912bc34
 --- /dev/null
 +++ b/src/handlers/organizations.rs
-@@ -0,0 +1,1760 @@
+@@ -0,0 +1,1872 @@
 +use axum::extract::{Path, State};
 +use axum::Json;
 +use serde::Deserialize;
@@ -3060,6 +3102,118 @@ index 0000000..2eb2bea
 +    ))
 +}
 +
++#[derive(Debug, Deserialize)]
++struct CollUserAccessRow {
++    organization_user_id: String,
++    read_only: i64,
++    hide_passwords: i64,
++    manage: i64,
++}
++#[derive(Debug, Deserialize)]
++struct CollGroupAccessRow {
++    group_id: String,
++    read_only: i64,
++    hide_passwords: i64,
++    manage: i64,
++}
++
++/// GET /api/organizations/{id}/collections/details — collections with per-user/group access.
++/// The Admin Console members + collections pages load this on mount; a 405/404 here leaves
++/// the whole org-admin component (incl. the Invite dialog) broken. (Was mis-routed to the
++/// /collections/{cid} wildcard → 405.)
++#[worker::send]
++pub async fn list_org_collections_details(
++    claims: Claims,
++    State(env): State<Arc<Env>>,
++    Path(org_id): Path<String>,
++) -> Result<Json<Value>, AppError> {
++    let db = db::get_db(&env)?;
++    let member = require_org_member(&db, &claims.sub, &org_id).await?;
++    let manage_all = member.atype <= TYPE_ADMIN;
++    let cols: Vec<Collection> = d1_query!(
++        &db,
++        "SELECT * FROM collections WHERE organization_id = ?1",
++        org_id
++    )
++    .map_err(|_| AppError::Database)?
++    .all()
++    .await?
++    .results()
++    .map_err(|_| AppError::Database)?;
++
++    let mut items = Vec::with_capacity(cols.len());
++    for col in &cols {
++        let urows: Vec<CollUserAccessRow> = d1_query!(
++            &db,
++            "SELECT organization_user_id, read_only, hide_passwords, manage FROM collection_users WHERE collection_id = ?1",
++            col.id
++        )
++        .map_err(|_| AppError::Database)?
++        .all()
++        .await?
++        .results()
++        .map_err(|_| AppError::Database)?;
++        let grows: Vec<CollGroupAccessRow> = d1_query!(
++            &db,
++            "SELECT group_id, read_only, hide_passwords, manage FROM collection_groups WHERE collection_id = ?1",
++            col.id
++        )
++        .map_err(|_| AppError::Database)?
++        .all()
++        .await?
++        .results()
++        .map_err(|_| AppError::Database)?;
++        let users: Vec<Value> = urows
++            .iter()
++            .map(|u| {
++                json!({"id":u.organization_user_id,"readOnly":u.read_only!=0,"hidePasswords":u.hide_passwords!=0,"manage":u.manage!=0})
++            })
++            .collect();
++        let groups: Vec<Value> = grows
++            .iter()
++            .map(|g| {
++                json!({"id":g.group_id,"readOnly":g.read_only!=0,"hidePasswords":g.hide_passwords!=0,"manage":g.manage!=0})
++            })
++            .collect();
++        items.push(json!({
++            "id": col.id,
++            "organizationId": col.organization_id,
++            "name": col.name,
++            "externalId": col.external_id,
++            "readOnly": false,
++            "hidePasswords": false,
++            "manage": manage_all,
++            "assigned": true,
++            "users": users,
++            "groups": groups,
++            "object": "collectionAccessDetails",
++        }));
++    }
++    Ok(Json(
++        json!({ "data": items, "object": "list", "continuationToken": Value::Null }),
++    ))
++}
++
++/// GET /api/organizations/{id}/billing/vnext/self-host/metadata — self-host billing stub.
++#[worker::send]
++pub async fn get_self_host_billing_metadata(
++    State(_env): State<Arc<Env>>,
++    Path(_org_id): Path<String>,
++) -> Result<Json<Value>, AppError> {
++    Ok(Json(json!({
++        "isEligibleForSelfHost": true,
++        "isManaged": false,
++        "isOnSecretsManagerStandalone": false,
++        "isSubscriptionUnpaid": false,
++        "hasSubscription": false,
++        "hasOpenInvoice": false,
++        "invoiceDueDate": Value::Null,
++        "invoiceCreatedDate": Value::Null,
++        "subPeriodEndDate": Value::Null,
++        "object": "organizationMetadata",
++    })))
++}
++
 +/// POST /api/organizations/{id}/collections/bulk-access — bulk member/group→collection
 +/// assignment from the collection dialogs (Owner/Admin). Accepts the payload; per-collection
 +/// assignment is also available via the per-collection users endpoint.
@@ -4528,7 +4682,7 @@ index 0000000..0a69c95
 +    })
 +}
 diff --git a/src/router.rs b/src/router.rs
-index 5cab746..d3e6685 100644
+index 5cab746..d323d3d 100644
 --- a/src/router.rs
 +++ b/src/router.rs
 @@ -7,7 +7,8 @@ use worker::Env;
@@ -4541,7 +4695,19 @@ index 5cab746..d3e6685 100644
  };
  
  pub fn api_router(env: Env) -> Router {
-@@ -161,6 +162,17 @@ pub fn api_router(env: Env) -> Router {
+@@ -79,6 +80,11 @@ pub fn api_router(env: Env) -> Router {
+         )
+         // Ciphers CRUD
+         .route("/api/ciphers", get(ciphers::list_ciphers))
++        // All ciphers in an org (Admin Console items view — static beats /ciphers/{id})
++        .route(
++            "/api/ciphers/organization-details",
++            get(ciphers::organization_cipher_details),
++        )
+         .route("/api/ciphers", post(ciphers::create_cipher_simple))
+         .route("/api/ciphers/create", post(ciphers::create_cipher))
+         .route("/api/ciphers/import", post(import::import_data))
+@@ -161,6 +167,17 @@ pub fn api_router(env: Env) -> Router {
              "/api/ciphers/unarchive",
              put(ciphers::unarchive_ciphers_bulk),
          )
@@ -4559,7 +4725,7 @@ index 5cab746..d3e6685 100644
          // Move ciphers to folder
          .route("/api/ciphers/move", post(ciphers::move_cipher_selected))
          .route("/api/ciphers/move", put(ciphers::move_cipher_selected))
-@@ -195,6 +207,149 @@ pub fn api_router(env: Env) -> Router {
+@@ -195,6 +212,159 @@ pub fn api_router(env: Env) -> Router {
              "/api/sends/{send_id}/access/file/{file_id}",
              post(sends::access_file_send),
          )
@@ -4705,6 +4871,16 @@ index 5cab746..d3e6685 100644
 +        .route(
 +            "/api/organizations/{id}/collections/bulk-access",
 +            post(organizations::post_collections_bulk_access),
++        )
++        // Collections with per-user/group access (Admin Console members + collections pages)
++        .route(
++            "/api/organizations/{id}/collections/details",
++            get(organizations::list_org_collections_details),
++        )
++        // Self-host billing metadata stub (Admin Console org page)
++        .route(
++            "/api/organizations/{id}/billing/vnext/self-host/metadata",
++            get(organizations::get_self_host_billing_metadata),
 +        )
          .route("/api/config", get(config::config))
          // Meta endpoints (mirrors a subset of vaultwarden core/mod.rs)
