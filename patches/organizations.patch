@@ -138,6 +138,466 @@ index f8c4029..45a90ad 100644
 +    FOREIGN KEY (cipher_id) REFERENCES ciphers(id) ON DELETE CASCADE
 +);
 +CREATE INDEX IF NOT EXISTS idx_collection_ciphers_cipher ON collection_ciphers(cipher_id);
+diff --git a/src/handlers/ciphers.rs b/src/handlers/ciphers.rs
+index f155c55..77b487e 100644
+--- a/src/handlers/ciphers.rs
++++ b/src/handlers/ciphers.rs
+@@ -64,9 +64,16 @@ pub async fn create_cipher(
+ 
+     let data_value = serde_json::to_value(&cipher_data).map_err(|_| AppError::Internal)?;
+ 
++    // Org-owned ciphers (created with an organizationId) belong to the org, not the
++    // creator — access is via collection membership, matching Bitwarden's model.
++    let owner_user_id = if cipher_data_req.organization_id.is_some() {
++        None
++    } else {
++        Some(claims.sub.clone())
++    };
+     let mut cipher = Cipher {
+         id: Uuid::new_v4().to_string(),
+-        user_id: Some(claims.sub.clone()),
++        user_id: owner_user_id,
+         organization_id: cipher_data_req.organization_id.clone(),
+         r#type: cipher_data_req.r#type,
+         data: data_value,
+@@ -108,6 +115,36 @@ pub async fn create_cipher(
+     .run()
+     .await?;
+ 
++    // Link the cipher into its collections — but only collections that belong to the
++    // cipher's own organization (cross-org guard).
++    if let (Some(ref collection_ids), Some(ref org_id)) =
++        (&cipher.collection_ids, &cipher.organization_id)
++    {
++        for cid in collection_ids {
++            let belongs: Option<CollectionIdRow> = d1_query!(
++                &db,
++                "SELECT id FROM collections WHERE id = ?1 AND organization_id = ?2",
++                cid,
++                org_id
++            )
++            .map_err(|_| AppError::Database)?
++            .first(None)
++            .await?;
++            if belongs.is_none() {
++                continue;
++            }
++            d1_query!(
++                &db,
++                "INSERT OR IGNORE INTO collection_ciphers (collection_id, cipher_id) VALUES (?1, ?2)",
++                cid,
++                cipher.id
++            )
++            .map_err(|_| AppError::Database)?
++            .run()
++            .await?;
++        }
++    }
++
+     attachments::hydrate_cipher_attachments(&db, env.as_ref(), &mut cipher).await?;
+     db::touch_user_updated_at(&db, &claims.sub, &cipher.updated_at).await?;
+ 
+@@ -123,6 +160,271 @@ pub async fn create_cipher(
+     Ok(Json(cipher))
+ }
+ 
++#[derive(Debug, Deserialize)]
++#[serde(rename_all = "camelCase")]
++pub struct CipherCollectionsRequest {
++    #[serde(default)]
++    pub collection_ids: Vec<String>,
++}
++
++#[derive(Debug, Deserialize)]
++struct CollectionIdRow {
++    #[allow(dead_code)]
++    id: String,
++}
++
++/// Fetch a cipher row by id only (not scoped to a user). Used for org ciphers.
++/// Coalesces a NULL user_id to "" so org-owned ciphers deserialize into CipherDBModel.
++async fn fetch_cipher_by_id(db: &crate::db::Db, id: &str) -> Result<CipherDBModel, AppError> {
++    db.prepare(
++        "SELECT id, COALESCE(user_id, '') AS user_id, organization_id, type, data, favorite, \
++                folder_id, deleted_at, archived_at, created_at, updated_at \
++         FROM ciphers WHERE id = ?1",
++    )
++    .bind(&[id.to_string().into()])?
++    .first(None)
++    .await
++    .map_err(|_| AppError::Database)?
++    .ok_or_else(|| AppError::NotFound("Cipher not found".to_string()))
++}
++
++/// Is this user an Owner/Admin of the given org?
++async fn is_org_manager(db: &crate::db::Db, org_id: &str, user_id: &str) -> Result<bool, AppError> {
++    let row: Option<CollectionIdRow> = db
++        .prepare("SELECT id FROM organization_users WHERE organization_id = ?1 AND user_id = ?2 AND status = 2 AND atype <= 1")
++        .bind(&[org_id.to_string().into(), user_id.to_string().into()])?
++        .first(None)
++        .await
++        .map_err(|_| AppError::Database)?;
++    Ok(row.is_some())
++}
++
++/// Can the user READ this cipher (own it, or org admin, or assigned to a collection holding it)?
++async fn user_can_access_cipher(
++    db: &crate::db::Db,
++    cipher: &CipherDBModel,
++    user_id: &str,
++) -> Result<bool, AppError> {
++    if cipher.user_id == user_id {
++        return Ok(true);
++    }
++    let org_id = match cipher.organization_id.as_deref() {
++        Some(o) => o,
++        None => return Ok(false),
++    };
++    if is_org_manager(db, org_id, user_id).await? {
++        return Ok(true);
++    }
++    let row: Option<CollectionIdRow> = db
++        .prepare(
++            "SELECT cc.cipher_id AS id FROM collection_ciphers cc \
++             JOIN collection_users cu ON cu.collection_id = cc.collection_id \
++             JOIN organization_users ou ON ou.id = cu.organization_user_id \
++             WHERE cc.cipher_id = ?1 AND ou.user_id = ?2 AND ou.status = 2",
++        )
++        .bind(&[cipher.id.clone().into(), user_id.to_string().into()])?
++        .first(None)
++        .await
++        .map_err(|_| AppError::Database)?;
++    Ok(row.is_some())
++}
++
++/// Can the user EDIT this cipher (own it, or org admin, or `manage` on a holding collection)?
++async fn user_can_manage_cipher(
++    db: &crate::db::Db,
++    cipher: &CipherDBModel,
++    user_id: &str,
++) -> Result<bool, AppError> {
++    if cipher.user_id == user_id {
++        return Ok(true);
++    }
++    let org_id = match cipher.organization_id.as_deref() {
++        Some(o) => o,
++        None => return Ok(false),
++    };
++    if is_org_manager(db, org_id, user_id).await? {
++        return Ok(true);
++    }
++    let row: Option<CollectionIdRow> = db
++        .prepare(
++            "SELECT cc.cipher_id AS id FROM collection_ciphers cc \
++             JOIN collection_users cu ON cu.collection_id = cc.collection_id \
++             JOIN organization_users ou ON ou.id = cu.organization_user_id \
++             WHERE cc.cipher_id = ?1 AND ou.user_id = ?2 AND ou.status = 2 AND cu.manage = 1",
++        )
++        .bind(&[cipher.id.clone().into(), user_id.to_string().into()])?
++        .first(None)
++        .await
++        .map_err(|_| AppError::Database)?;
++    Ok(row.is_some())
++}
++
++/// Fetch a cipher the user may READ (personal or accessible org cipher).
++async fn fetch_cipher_for_read(
++    db: &crate::db::Db,
++    id: &str,
++    user_id: &str,
++) -> Result<CipherDBModel, AppError> {
++    let c = fetch_cipher_by_id(db, id).await?;
++    if user_can_access_cipher(db, &c, user_id).await? {
++        Ok(c)
++    } else {
++        Err(AppError::NotFound("Cipher not found".to_string()))
++    }
++}
++
++/// Fetch a cipher the user may EDIT (personal or manageable org cipher).
++async fn fetch_cipher_for_edit(
++    db: &crate::db::Db,
++    id: &str,
++    user_id: &str,
++) -> Result<CipherDBModel, AppError> {
++    let c = fetch_cipher_by_id(db, id).await?;
++    if user_can_manage_cipher(db, &c, user_id).await? {
++        Ok(c)
++    } else {
++        Err(AppError::NotFound("Cipher not found".to_string()))
++    }
++}
++
++/// PUT /api/ciphers/{id}/share — move a personal cipher into an organization.
++/// The body carries the cipher re-encrypted with the org key + target collectionIds.
++#[worker::send]
++pub async fn share_cipher(
++    claims: Claims,
++    State(env): State<Arc<Env>>,
++    Path(id): Path<String>,
++    Json(payload): Json<CreateCipherRequest>,
++) -> Result<Json<Cipher>, AppError> {
++    let db = db::get_db(&env)?;
++    let now = db::now_string();
++    let cipher_data_req = payload.cipher;
++    let org_id = cipher_data_req
++        .organization_id
++        .clone()
++        .ok_or_else(|| AppError::BadRequest("organizationId is required to share".to_string()))?;
++
++    // Must currently own the personal cipher, and be a member of the target org.
++    fetch_cipher_for_user(&db, &id, &claims.sub).await?;
++    crate::handlers::organizations::require_org_member(&db, &claims.sub, &org_id).await?;
++
++    let cipher_data = CipherData::new(
++        cipher_data_req.name,
++        cipher_data_req.notes,
++        cipher_data_req.type_fields,
++    );
++    let data_value = serde_json::to_value(&cipher_data).map_err(|_| AppError::Internal)?;
++    let data = serde_json::to_string(&data_value).map_err(|_| AppError::Internal)?;
++
++    d1_query!(
++        &db,
++        "UPDATE ciphers SET user_id = NULL, organization_id = ?1, data = ?2, folder_id = ?3, updated_at = ?4 WHERE id = ?5",
++        org_id,
++        data,
++        cipher_data_req.folder_id,
++        now,
++        id
++    )
++    .map_err(|_| AppError::Database)?
++    .run()
++    .await?;
++
++    for cid in &payload.collection_ids {
++        // Only link collections that belong to the target org (cross-org guard).
++        let belongs: Option<CollectionIdRow> = d1_query!(
++            &db,
++            "SELECT id FROM collections WHERE id = ?1 AND organization_id = ?2",
++            cid,
++            org_id
++        )
++        .map_err(|_| AppError::Database)?
++        .first(None)
++        .await?;
++        if belongs.is_none() {
++            continue;
++        }
++        d1_query!(
++            &db,
++            "INSERT OR IGNORE INTO collection_ciphers (collection_id, cipher_id) VALUES (?1, ?2)",
++            cid,
++            id
++        )
++        .map_err(|_| AppError::Database)?
++        .run()
++        .await?;
++    }
++
++    db::touch_user_updated_at(&db, &claims.sub, &now).await?;
++    notifications::publish_cipher_update(
++        (*env).clone(),
++        claims.sub.clone(),
++        UpdateType::SyncCipherUpdate,
++        id.clone(),
++        now.clone(),
++        Some(claims.device.clone()),
++    );
++
++    let mut cipher: Cipher = fetch_cipher_by_id(&db, &id).await?.into();
++    attachments::hydrate_cipher_attachments(&db, env.as_ref(), &mut cipher).await?;
++    Ok(Json(cipher))
++}
++
++/// PUT /api/ciphers/{id}/collections — set which collections an org cipher belongs to.
++#[worker::send]
++pub async fn set_cipher_collections(
++    claims: Claims,
++    State(env): State<Arc<Env>>,
++    Path(id): Path<String>,
++    Json(payload): Json<CipherCollectionsRequest>,
++) -> Result<Json<()>, AppError> {
++    let db = db::get_db(&env)?;
++    let now = db::now_string();
++
++    let row = fetch_cipher_by_id(&db, &id).await?;
++    let org_id = row
++        .organization_id
++        .clone()
++        .ok_or_else(|| AppError::BadRequest("Cipher is not in an organization".to_string()))?;
++    crate::handlers::organizations::require_org_member(&db, &claims.sub, &org_id).await?;
++
++    d1_query!(
++        &db,
++        "DELETE FROM collection_ciphers WHERE cipher_id = ?1",
++        id
++    )
++    .map_err(|_| AppError::Database)?
++    .run()
++    .await?;
++
++    for cid in &payload.collection_ids {
++        // Only link collections that belong to this cipher's org.
++        let belongs: Option<CollectionIdRow> = d1_query!(
++            &db,
++            "SELECT id FROM collections WHERE id = ?1 AND organization_id = ?2",
++            cid,
++            org_id
++        )
++        .map_err(|_| AppError::Database)?
++        .first(None)
++        .await?;
++        if belongs.is_none() {
++            continue;
++        }
++        d1_query!(
++            &db,
++            "INSERT OR IGNORE INTO collection_ciphers (collection_id, cipher_id) VALUES (?1, ?2)",
++            cid,
++            id
++        )
++        .map_err(|_| AppError::Database)?
++        .run()
++        .await?;
++    }
++
++    db::touch_user_updated_at(&db, &claims.sub, &now).await?;
++    Ok(Json(()))
++}
++
+ #[worker::send]
+ pub async fn update_cipher(
+     claims: Claims,
+@@ -134,7 +436,13 @@ pub async fn update_cipher(
+     let db = db::get_db(&env)?;
+     let now = db::now_string();
+ 
+-    let existing_cipher = fetch_cipher_for_user(&db, &id, &claims.sub).await?;
++    let existing_cipher = fetch_cipher_for_edit(&db, &id, &claims.sub).await?;
++    // Preserve org-ownership: empty user_id means this is an org-owned cipher.
++    let existing_owner: Option<String> = if existing_cipher.user_id.is_empty() {
++        None
++    } else {
++        Some(existing_cipher.user_id.clone())
++    };
+ 
+     // Validate folder ownership if provided
+     if let Some(ref folder_id) = payload.folder_id {
+@@ -179,7 +487,7 @@ pub async fn update_cipher(
+ 
+     let mut cipher = Cipher {
+         id: id.clone(),
+-        user_id: Some(claims.sub.clone()),
++        user_id: existing_owner,
+         organization_id: payload.organization_id.clone(),
+         r#type: payload.r#type,
+         data: data_value,
+@@ -201,7 +509,9 @@ pub async fn update_cipher(
+ 
+     d1_query!(
+         &db,
+-        "UPDATE ciphers SET organization_id = ?1, type = ?2, data = ?3, favorite = ?4, folder_id = ?5, updated_at = ?6 WHERE id = ?7 AND user_id = ?8",
++        // Access already verified by fetch_cipher_for_edit; the (user_id = ?8 OR
++        // user_id IS NULL) guard keeps us from ever touching another user's personal cipher.
++        "UPDATE ciphers SET organization_id = ?1, type = ?2, data = ?3, favorite = ?4, folder_id = ?5, updated_at = ?6 WHERE id = ?7 AND (user_id = ?8 OR user_id IS NULL)",
+         cipher.organization_id,
+         cipher.r#type,
+         data,
+@@ -280,7 +590,7 @@ pub async fn get_cipher(
+     Path(id): Path<String>,
+ ) -> Result<Json<Cipher>, AppError> {
+     let db = db::get_db(&env)?;
+-    let cipher = fetch_cipher_for_user(&db, &id, &claims.sub).await?;
++    let cipher = fetch_cipher_for_read(&db, &id, &claims.sub).await?;
+     let mut cipher: Cipher = cipher.into();
+ 
+     attachments::hydrate_cipher_attachments(&db, env.as_ref(), &mut cipher).await?;
+@@ -325,7 +635,7 @@ pub async fn update_cipher_partial(
+     }
+ 
+     // Ensure cipher exists and belongs to user
+-    fetch_cipher_for_user(&db, &id, user_id).await?;
++    fetch_cipher_for_read(&db, &id, user_id).await?;
+ 
+     let now = db::now_string();
+ 
+@@ -345,7 +655,7 @@ pub async fn update_cipher_partial(
+     let now = db::now_string();
+     db::touch_user_updated_at(&db, user_id, &now).await?;
+ 
+-    let cipher = fetch_cipher_for_user(&db, &id, user_id).await?;
++    let cipher = fetch_cipher_for_read(&db, &id, user_id).await?;
+     let mut cipher: Cipher = cipher.into();
+ 
+     attachments::hydrate_cipher_attachments(&db, env.as_ref(), &mut cipher).await?;
+@@ -362,12 +672,12 @@ pub async fn soft_delete_cipher(
+     Path(id): Path<String>,
+ ) -> Result<Json<()>, AppError> {
+     let db = db::get_db(&env)?;
+-    fetch_cipher_for_user(&db, &id, &claims.sub).await?;
++    fetch_cipher_for_edit(&db, &id, &claims.sub).await?;
+     let now = db::now_string();
+ 
+     d1_query!(
+         &db,
+-        "UPDATE ciphers SET deleted_at = ?1, updated_at = ?1 WHERE id = ?2 AND user_id = ?3",
++        "UPDATE ciphers SET deleted_at = ?1, updated_at = ?1 WHERE id = ?2 AND (user_id = ?3 OR user_id IS NULL)",
+         now,
+         id,
+         claims.sub
+@@ -436,7 +746,7 @@ pub async fn hard_delete_cipher(
+     Path(id): Path<String>,
+ ) -> Result<Json<()>, AppError> {
+     let db = db::get_db(&env)?;
+-    fetch_cipher_for_user(&db, &id, &claims.sub).await?;
++    fetch_cipher_for_edit(&db, &id, &claims.sub).await?;
+     let now = db::now_string();
+ 
+     if attachments::attachments_enabled(env.as_ref()) {
+@@ -453,7 +763,7 @@ pub async fn hard_delete_cipher(
+ 
+     d1_query!(
+         &db,
+-        "DELETE FROM ciphers WHERE id = ?1 AND user_id = ?2",
++        "DELETE FROM ciphers WHERE id = ?1 AND (user_id = ?2 OR user_id IS NULL)",
+         id,
+         claims.sub
+     )
+@@ -531,13 +841,13 @@ pub async fn restore_cipher(
+     Path(id): Path<String>,
+ ) -> Result<Json<Cipher>, AppError> {
+     let db = db::get_db(&env)?;
+-    fetch_cipher_for_user(&db, &id, &claims.sub).await?;
++    fetch_cipher_for_edit(&db, &id, &claims.sub).await?;
+     let now = db::now_string();
+ 
+     // Update the cipher to clear deleted_at
+     d1_query!(
+         &db,
+-        "UPDATE ciphers SET deleted_at = NULL, updated_at = ?1 WHERE id = ?2 AND user_id = ?3",
++        "UPDATE ciphers SET deleted_at = NULL, updated_at = ?1 WHERE id = ?2 AND (user_id = ?3 OR user_id IS NULL)",
+         now,
+         id,
+         claims.sub
+@@ -546,7 +856,7 @@ pub async fn restore_cipher(
+     .run()
+     .await?;
+ 
+-    let restored = fetch_cipher_for_user(&db, &id, &claims.sub).await?;
++    let restored = fetch_cipher_for_read(&db, &id, &claims.sub).await?;
+     let mut cipher: Cipher = restored.into();
+     attachments::hydrate_cipher_attachments(&db, env.as_ref(), &mut cipher).await?;
+ 
+@@ -1028,7 +1338,7 @@ fn cipher_json_expr(attachments_enabled: bool) -> String {
+             'viewPassword', json('true'),
+             'permissions', json_object('delete', json('true'), 'restore', json('true')),
+             'organizationUseTotp', json('false'),
+-            'collectionIds', json('[]'),
++            'collectionIds', COALESCE((SELECT json_group_array(cc.collection_id) FROM collection_ciphers cc WHERE cc.cipher_id = c.id), json('[]')),
+             'revisionDate', c.updated_at,
+             'creationDate', c.created_at,
+             'deletedDate', c.deleted_at,
 diff --git a/src/handlers/mod.rs b/src/handlers/mod.rs
 index 1c809c6..ab78d9b 100644
 --- a/src/handlers/mod.rs
@@ -152,10 +612,10 @@ index 1c809c6..ab78d9b 100644
  pub mod streaming;
 diff --git a/src/handlers/organizations.rs b/src/handlers/organizations.rs
 new file mode 100644
-index 0000000..1e6ef7e
+index 0000000..674b3cf
 --- /dev/null
 +++ b/src/handlers/organizations.rs
-@@ -0,0 +1,466 @@
+@@ -0,0 +1,1196 @@
 +use axum::extract::{Path, State};
 +use axum::Json;
 +use serde::Deserialize;
@@ -168,9 +628,12 @@ index 0000000..1e6ef7e
 +use crate::db::{self, touch_user_updated_at, Db};
 +use crate::error::AppError;
 +use crate::models::organization::{
-+    collection_details, collection_response, organization_response, profile_organization,
-+    Collection, CreateCollectionRequest, CreateOrganizationRequest, Organization, OrganizationUser,
-+    STATUS_CONFIRMED, TYPE_ADMIN, TYPE_OWNER,
++    collection_details, collection_membership, collection_response, org_user_details,
++    organization_response, profile_organization, AcceptInviteRequest, Collection,
++    CollectionAccessSelection, ConfirmUserRequest, CreateCollectionRequest,
++    CreateOrganizationRequest, InviteUsersRequest, Organization, OrganizationUser,
++    PutCollectionUsersRequest, UpdateOrgUserRequest, UpdateOrganizationRequest, STATUS_ACCEPTED,
++    STATUS_CONFIRMED, STATUS_INVITED, TYPE_ADMIN, TYPE_OWNER,
 +};
 +use crate::d1_query;
 +
@@ -549,6 +1012,35 @@ index 0000000..1e6ef7e
 +    .run()
 +    .await?;
 +
++    // Assign any additional members the client specified (each id is an org_user id).
++    for sel in &payload.users {
++        let in_org: Option<IdRow> = d1_query!(
++            &db,
++            "SELECT id FROM organization_users WHERE id = ?1 AND organization_id = ?2",
++            sel.id,
++            col.organization_id
++        )
++        .map_err(|_| AppError::Database)?
++        .first(None)
++        .await?;
++        if in_org.is_none() {
++            continue;
++        }
++        d1_query!(
++            &db,
++            "INSERT OR REPLACE INTO collection_users (collection_id, organization_user_id, read_only, hide_passwords, manage) \
++             VALUES (?1, ?2, ?3, ?4, ?5)",
++            col.id,
++            sel.id,
++            sel.read_only,
++            sel.hide_passwords,
++            sel.manage
++        )
++        .map_err(|_| AppError::Database)?
++        .run()
++        .await?;
++    }
++
 +    Ok(Json(collection_response(&col)))
 +}
 +
@@ -622,8 +1114,706 @@ index 0000000..1e6ef7e
 +
 +    Ok(Json(()))
 +}
++
++// ============================================================================
++// Shared helpers for membership + collection assignment
++// ============================================================================
++
++#[derive(Debug, Deserialize)]
++struct IdRow {
++    #[allow(dead_code)]
++    id: String,
++}
++
++#[derive(Debug, Deserialize)]
++struct UserLookupRow {
++    id: String,
++    name: Option<String>,
++}
++
++/// Look up an existing account by email (emails are UNIQUE).
++async fn resolve_user_by_email(db: &Db, email: &str) -> Result<Option<UserLookupRow>, AppError> {
++    d1_query!(db, "SELECT id, name FROM users WHERE email = ?1", email)
++        .map_err(|_| AppError::Database)?
++        .first(None)
++        .await
++        .map_err(|_| AppError::Database)
++}
++
++/// Replace a member's per-collection access rows. Selections referencing a
++/// collection outside this org are silently ignored (cross-org guard).
++async fn assign_member_collections(
++    db: &Db,
++    org_id: &str,
++    org_user_id: &str,
++    selections: &[CollectionAccessSelection],
++) -> Result<(), AppError> {
++    d1_query!(
++        db,
++        "DELETE FROM collection_users WHERE organization_user_id = ?1",
++        org_user_id
++    )
++    .map_err(|_| AppError::Database)?
++    .run()
++    .await?;
++
++    for sel in selections {
++        let belongs: Option<IdRow> = d1_query!(
++            db,
++            "SELECT id FROM collections WHERE id = ?1 AND organization_id = ?2",
++            sel.id,
++            org_id
++        )
++        .map_err(|_| AppError::Database)?
++        .first(None)
++        .await?;
++        if belongs.is_none() {
++            continue;
++        }
++        d1_query!(
++            db,
++            "INSERT INTO collection_users (collection_id, organization_user_id, read_only, hide_passwords, manage) \
++             VALUES (?1, ?2, ?3, ?4, ?5)",
++            sel.id,
++            org_user_id,
++            sel.read_only,
++            sel.hide_passwords,
++            sel.manage
++        )
++        .map_err(|_| AppError::Database)?
++        .run()
++        .await?;
++    }
++    Ok(())
++}
++
++#[derive(Debug, Deserialize)]
++struct CollAccessRow {
++    collection_id: String,
++    read_only: i64,
++    hide_passwords: i64,
++    manage: i64,
++}
++
++/// The collection-access entries for a member (for the member-detail responses).
++async fn member_collections_json(db: &Db, org_user_id: &str) -> Result<Vec<Value>, AppError> {
++    let rows: Vec<CollAccessRow> = d1_query!(
++        db,
++        "SELECT collection_id, read_only, hide_passwords, manage FROM collection_users WHERE organization_user_id = ?1",
++        org_user_id
++    )
++    .map_err(|_| AppError::Database)?
++    .all()
++    .await?
++    .results()
++    .map_err(|_| AppError::Database)?;
++
++    Ok(rows
++        .into_iter()
++        .map(|r| {
++            collection_membership(&r.collection_id, r.read_only != 0, r.hide_passwords != 0, r.manage != 0)
++        })
++        .collect())
++}
++
++/// Fetch one membership row by its id, scoped to the org.
++async fn fetch_membership(
++    db: &Db,
++    org_id: &str,
++    org_user_id: &str,
++) -> Result<OrganizationUser, AppError> {
++    d1_query!(
++        db,
++        "SELECT * FROM organization_users WHERE id = ?1 AND organization_id = ?2",
++        org_user_id,
++        org_id
++    )
++    .map_err(|_| AppError::Database)?
++    .first(None)
++    .await?
++    .ok_or_else(|| AppError::NotFound("Member not found".to_string()))
++}
++
++#[derive(Debug, Deserialize)]
++struct CountRow {
++    n: i64,
++}
++
++/// Number of confirmed owners in an org (used to protect the last owner).
++async fn confirmed_owner_count(db: &Db, org_id: &str) -> Result<i64, AppError> {
++    let row: Option<CountRow> = d1_query!(
++        db,
++        "SELECT COUNT(*) AS n FROM organization_users WHERE organization_id = ?1 AND atype = ?2 AND status = ?3",
++        org_id,
++        TYPE_OWNER,
++        STATUS_CONFIRMED
++    )
++    .map_err(|_| AppError::Database)?
++    .first(None)
++    .await?;
++    Ok(row.map(|r| r.n).unwrap_or(0))
++}
++
++/// Manual-confirm mode: when no email is wired up, invited existing accounts are
++/// set straight to Accepted (Vaultwarden's no-SMTP behavior) so the admin only
++/// needs to confirm. Set ORG_AUTO_ACCEPT_INVITES="false" to require explicit accept.
++fn auto_accept_invites(env: &Env) -> bool {
++    env.var("ORG_AUTO_ACCEPT_INVITES")
++        .map(|v| v.to_string() != "false")
++        .unwrap_or(true)
++}
++
++// ============================================================================
++// Organization management
++// ============================================================================
++
++/// PUT /api/organizations/{id} — rename / update billing email (Owner only).
++#[worker::send]
++pub async fn update_organization(
++    claims: Claims,
++    State(env): State<Arc<Env>>,
++    Path(org_id): Path<String>,
++    Json(payload): Json<UpdateOrganizationRequest>,
++) -> Result<Json<Value>, AppError> {
++    let db = db::get_db(&env)?;
++    let member = require_org_member(&db, &claims.sub, &org_id).await?;
++    if member.atype != TYPE_OWNER {
++        return Err(AppError::Unauthorized("Only owners can edit the organization".to_string()));
++    }
++    let now = db::now_string();
++
++    let mut org: Organization = d1_query!(&db, "SELECT * FROM organizations WHERE id = ?1", org_id)
++        .map_err(|_| AppError::Database)?
++        .first(None)
++        .await?
++        .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
++    org.name = payload.name;
++    if let Some(be) = payload.billing_email {
++        org.billing_email = be;
++    }
++
++    d1_query!(
++        &db,
++        "UPDATE organizations SET name = ?1, billing_email = ?2, updated_at = ?3 WHERE id = ?4",
++        org.name,
++        org.billing_email,
++        now,
++        org.id
++    )
++    .map_err(|_| AppError::Database)?
++    .run()
++    .await?;
++
++    Ok(Json(organization_response(&org, member.atype)))
++}
++
++/// GET /api/organizations/{id}/keys — the org RSA keypair (members only).
++#[worker::send]
++pub async fn get_organization_keys(
++    claims: Claims,
++    State(env): State<Arc<Env>>,
++    Path(org_id): Path<String>,
++) -> Result<Json<Value>, AppError> {
++    let db = db::get_db(&env)?;
++    require_org_member(&db, &claims.sub, &org_id).await?;
++
++    let org: Organization = d1_query!(&db, "SELECT * FROM organizations WHERE id = ?1", org_id)
++        .map_err(|_| AppError::Database)?
++        .first(None)
++        .await?
++        .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
++
++    Ok(Json(json!({
++        "id": org.id,
++        "publicKey": org.public_key,
++        "privateKey": org.private_key,
++        "object": "organizationKeys",
++    })))
++}
++
++/// DELETE /api/organizations/{id} — delete the org and its org-owned ciphers (Owner only).
++#[worker::send]
++pub async fn delete_organization(
++    claims: Claims,
++    State(env): State<Arc<Env>>,
++    Path(org_id): Path<String>,
++) -> Result<Json<()>, AppError> {
++    let db = db::get_db(&env)?;
++    let member = require_org_member(&db, &claims.sub, &org_id).await?;
++    if member.atype != TYPE_OWNER {
++        return Err(AppError::Unauthorized("Only owners can delete the organization".to_string()));
++    }
++
++    // Org-owned ciphers have no FK to organizations; remove them explicitly.
++    d1_query!(
++        &db,
++        "DELETE FROM ciphers WHERE organization_id = ?1 AND user_id IS NULL",
++        org_id
++    )
++    .map_err(|_| AppError::Database)?
++    .run()
++    .await?;
++    // Cascades remove organization_users, collections, collection_users, collection_ciphers.
++    d1_query!(&db, "DELETE FROM organizations WHERE id = ?1", org_id)
++        .map_err(|_| AppError::Database)?
++        .run()
++        .await?;
++
++    Ok(Json(()))
++}
++
++/// POST /api/organizations/{id}/leave — caller removes their own membership.
++#[worker::send]
++pub async fn leave_organization(
++    claims: Claims,
++    State(env): State<Arc<Env>>,
++    Path(org_id): Path<String>,
++) -> Result<Json<()>, AppError> {
++    let db = db::get_db(&env)?;
++    let member = require_org_member(&db, &claims.sub, &org_id).await?;
++    if member.atype == TYPE_OWNER && confirmed_owner_count(&db, &org_id).await? <= 1 {
++        return Err(AppError::BadRequest(
++            "You are the only owner; transfer ownership before leaving".to_string(),
++        ));
++    }
++    d1_query!(
++        &db,
++        "DELETE FROM organization_users WHERE id = ?1",
++        member.id
++    )
++    .map_err(|_| AppError::Database)?
++    .run()
++    .await?;
++    Ok(Json(()))
++}
++
++// ============================================================================
++// Member management
++// ============================================================================
++
++fn member_list(items: Vec<Value>) -> Value {
++    json!({ "data": items, "object": "list", "continuationToken": Value::Null })
++}
++
++#[derive(Debug, Deserialize)]
++struct OrgMemberRow {
++    id: String,
++    user_id: Option<String>,
++    email: String,
++    atype: i64,
++    status: i64,
++    name: Option<String>,
++}
++
++/// GET /api/organizations/{id}/users — list members (members only).
++#[worker::send]
++pub async fn list_org_users(
++    claims: Claims,
++    State(env): State<Arc<Env>>,
++    Path(org_id): Path<String>,
++) -> Result<Json<Value>, AppError> {
++    let db = db::get_db(&env)?;
++    require_org_member(&db, &claims.sub, &org_id).await?;
++
++    let rows: Vec<OrgMemberRow> = d1_query!(
++        &db,
++        "SELECT ou.id AS id, ou.user_id AS user_id, ou.email AS email, ou.atype AS atype, \
++                ou.status AS status, u.name AS name \
++         FROM organization_users ou LEFT JOIN users u ON u.id = ou.user_id \
++         WHERE ou.organization_id = ?1",
++        org_id
++    )
++    .map_err(|_| AppError::Database)?
++    .all()
++    .await?
++    .results()
++    .map_err(|_| AppError::Database)?;
++
++    let mut items = Vec::with_capacity(rows.len());
++    for r in rows {
++        let collections = member_collections_json(&db, &r.id).await?;
++        items.push(org_user_details(
++            &r.id,
++            &r.user_id,
++            &r.name,
++            &r.email,
++            r.atype,
++            r.status,
++            collections,
++        ));
++    }
++    Ok(Json(member_list(items)))
++}
++
++/// GET /api/organizations/{id}/users/{ouid} — one member's detail (members only).
++#[worker::send]
++pub async fn get_org_user(
++    claims: Claims,
++    State(env): State<Arc<Env>>,
++    Path((org_id, ouid)): Path<(String, String)>,
++) -> Result<Json<Value>, AppError> {
++    let db = db::get_db(&env)?;
++    require_org_member(&db, &claims.sub, &org_id).await?;
++    let member = fetch_membership(&db, &org_id, &ouid).await?;
++
++    let name: Option<UserLookupRow> = match &member.user_id {
++        Some(uid) => d1_query!(&db, "SELECT id, name FROM users WHERE id = ?1", uid)
++            .map_err(|_| AppError::Database)?
++            .first(None)
++            .await?,
++        None => None,
++    };
++    let collections = member_collections_json(&db, &member.id).await?;
++    Ok(Json(org_user_details(
++        &member.id,
++        &member.user_id,
++        &name.and_then(|n| n.name),
++        &member.email,
++        member.atype,
++        member.status,
++        collections,
++    )))
++}
++
++/// POST /api/organizations/{id}/users/invite — invite members by email (Owner/Admin).
++///
++/// Cloudflare-native: no external email required. Existing accounts become members
++/// immediately (Accepted in manual-confirm mode); the admin then confirms with the
++/// member's wrapped key. Emails without an account on this vault are reported back.
++#[worker::send]
++pub async fn invite_users(
++    claims: Claims,
++    State(env): State<Arc<Env>>,
++    Path(org_id): Path<String>,
++    Json(payload): Json<InviteUsersRequest>,
++) -> Result<Json<Value>, AppError> {
++    let db = db::get_db(&env)?;
++    require_org_manage(&db, &claims.sub, &org_id).await?;
++    let now = db::now_string();
++    let accepted_status = if auto_accept_invites(&env) {
++        STATUS_ACCEPTED
++    } else {
++        STATUS_INVITED
++    };
++
++    let mut not_found: Vec<String> = Vec::new();
++    for email in &payload.emails {
++        let email = email.trim().to_lowercase();
++        if email.is_empty() {
++            continue;
++        }
++        let user = resolve_user_by_email(&db, &email).await?;
++        let (user_id, status) = match user {
++            Some(u) => (Some(u.id), accepted_status),
++            None => {
++                not_found.push(email.clone());
++                (None, STATUS_INVITED)
++            }
++        };
++
++        // Skip if this account is already a member.
++        if let Some(ref uid) = user_id {
++            let existing: Option<IdRow> = d1_query!(
++                &db,
++                "SELECT id FROM organization_users WHERE organization_id = ?1 AND user_id = ?2",
++                org_id,
++                uid
++            )
++            .map_err(|_| AppError::Database)?
++            .first(None)
++            .await?;
++            if existing.is_some() {
++                continue;
++            }
++        }
++
++        let ouid = Uuid::new_v4().to_string();
++        d1_query!(
++            &db,
++            "INSERT INTO organization_users (id, organization_id, user_id, email, akey, status, atype, created_at, updated_at) \
++             VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?8)",
++            ouid,
++            org_id,
++            user_id,
++            email,
++            status,
++            payload.atype,
++            now,
++            now
++        )
++        .map_err(|_| AppError::Database)?
++        .run()
++        .await?;
++
++        assign_member_collections(&db, &org_id, &ouid, &payload.collections).await?;
++    }
++
++    Ok(Json(json!({
++        "object": "organizationUserBulkResponse",
++        "notFound": not_found,
++    })))
++}
++
++/// POST /api/organizations/{id}/users/{ouid}/accept — invited user accepts.
++#[worker::send]
++pub async fn accept_invite(
++    claims: Claims,
++    State(env): State<Arc<Env>>,
++    Path((org_id, ouid)): Path<(String, String)>,
++    Json(_payload): Json<AcceptInviteRequest>,
++) -> Result<Json<()>, AppError> {
++    let db = db::get_db(&env)?;
++    let now = db::now_string();
++    // Only the invited user themselves can accept their own invite.
++    let updated = d1_query!(
++        &db,
++        "UPDATE organization_users SET status = ?1, updated_at = ?2 \
++         WHERE id = ?3 AND organization_id = ?4 AND user_id = ?5 AND status = ?6",
++        STATUS_ACCEPTED,
++        now,
++        ouid,
++        org_id,
++        claims.sub,
++        STATUS_INVITED
++    )
++    .map_err(|_| AppError::Database)?
++    .run()
++    .await?;
++    let _ = updated;
++    Ok(Json(()))
++}
++
++/// POST /api/organizations/{id}/users/{ouid}/confirm — admin confirms a member,
++/// storing the org symmetric key wrapped with that member's public key (Owner/Admin).
++#[worker::send]
++pub async fn confirm_user(
++    claims: Claims,
++    State(env): State<Arc<Env>>,
++    Path((org_id, ouid)): Path<(String, String)>,
++    Json(payload): Json<ConfirmUserRequest>,
++) -> Result<Json<()>, AppError> {
++    let db = db::get_db(&env)?;
++    require_org_manage(&db, &claims.sub, &org_id).await?;
++    let now = db::now_string();
++
++    d1_query!(
++        &db,
++        "UPDATE organization_users SET akey = ?1, status = ?2, updated_at = ?3 \
++         WHERE id = ?4 AND organization_id = ?5",
++        payload.key,
++        STATUS_CONFIRMED,
++        now,
++        ouid,
++        org_id
++    )
++    .map_err(|_| AppError::Database)?
++    .run()
++    .await?;
++    Ok(Json(()))
++}
++
++/// PUT /api/organizations/{id}/users/{ouid} — change a member's type + collections (Owner/Admin).
++#[worker::send]
++pub async fn update_org_user(
++    claims: Claims,
++    State(env): State<Arc<Env>>,
++    Path((org_id, ouid)): Path<(String, String)>,
++    Json(payload): Json<UpdateOrgUserRequest>,
++) -> Result<Json<()>, AppError> {
++    let db = db::get_db(&env)?;
++    require_org_manage(&db, &claims.sub, &org_id).await?;
++    let member = fetch_membership(&db, &org_id, &ouid).await?;
++    let now = db::now_string();
++
++    // Don't allow demoting the last owner.
++    if member.atype == TYPE_OWNER
++        && payload.atype != TYPE_OWNER
++        && confirmed_owner_count(&db, &org_id).await? <= 1
++    {
++        return Err(AppError::BadRequest(
++            "Cannot remove the last owner".to_string(),
++        ));
++    }
++
++    d1_query!(
++        &db,
++        "UPDATE organization_users SET atype = ?1, updated_at = ?2 WHERE id = ?3 AND organization_id = ?4",
++        payload.atype,
++        now,
++        ouid,
++        org_id
++    )
++    .map_err(|_| AppError::Database)?
++    .run()
++    .await?;
++
++    assign_member_collections(&db, &org_id, &ouid, &payload.collections).await?;
++    Ok(Json(()))
++}
++
++/// DELETE|POST /api/organizations/{id}/users/{ouid} — remove a member (Owner/Admin).
++#[worker::send]
++pub async fn remove_org_user(
++    claims: Claims,
++    State(env): State<Arc<Env>>,
++    Path((org_id, ouid)): Path<(String, String)>,
++) -> Result<Json<()>, AppError> {
++    let db = db::get_db(&env)?;
++    require_org_manage(&db, &claims.sub, &org_id).await?;
++    let member = fetch_membership(&db, &org_id, &ouid).await?;
++
++    if member.atype == TYPE_OWNER && confirmed_owner_count(&db, &org_id).await? <= 1 {
++        return Err(AppError::BadRequest(
++            "Cannot remove the last owner".to_string(),
++        ));
++    }
++    // Cascade removes the member's collection_users rows.
++    d1_query!(&db, "DELETE FROM organization_users WHERE id = ?1", member.id)
++        .map_err(|_| AppError::Database)?
++        .run()
++        .await?;
++    Ok(Json(()))
++}
++
++// ============================================================================
++// User public key (needed by the admin client to wrap the org key on confirm)
++// ============================================================================
++
++#[derive(Debug, Deserialize)]
++struct PublicKeyRow {
++    public_key: String,
++}
++
++/// GET /api/users/{id}/public-key — a user's RSA public key.
++#[worker::send]
++pub async fn get_user_public_key(
++    _claims: Claims,
++    State(env): State<Arc<Env>>,
++    Path(user_id): Path<String>,
++) -> Result<Json<Value>, AppError> {
++    let db = db::get_db(&env)?;
++    let row: PublicKeyRow = d1_query!(&db, "SELECT public_key FROM users WHERE id = ?1", user_id)
++        .map_err(|_| AppError::Database)?
++        .first(None)
++        .await?
++        .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
++    Ok(Json(json!({
++        "userId": user_id,
++        "publicKey": row.public_key,
++        "object": "userKey",
++    })))
++}
++
++// ============================================================================
++// Per-collection member assignment
++// ============================================================================
++
++/// GET /api/organizations/{id}/collections/{cid}/users — members assigned to a collection.
++#[worker::send]
++pub async fn get_collection_users(
++    claims: Claims,
++    State(env): State<Arc<Env>>,
++    Path((org_id, collection_id)): Path<(String, String)>,
++) -> Result<Json<Value>, AppError> {
++    let db = db::get_db(&env)?;
++    require_org_member(&db, &claims.sub, &org_id).await?;
++
++    #[derive(Debug, Deserialize)]
++    struct Row {
++        organization_user_id: String,
++        read_only: i64,
++        hide_passwords: i64,
++        manage: i64,
++    }
++    let rows: Vec<Row> = d1_query!(
++        &db,
++        "SELECT cu.organization_user_id AS organization_user_id, cu.read_only AS read_only, \
++                cu.hide_passwords AS hide_passwords, cu.manage AS manage \
++         FROM collection_users cu \
++         JOIN collections c ON c.id = cu.collection_id \
++         WHERE cu.collection_id = ?1 AND c.organization_id = ?2",
++        collection_id,
++        org_id
++    )
++    .map_err(|_| AppError::Database)?
++    .all()
++    .await?
++    .results()
++    .map_err(|_| AppError::Database)?;
++
++    let items: Vec<Value> = rows
++        .into_iter()
++        .map(|r| {
++            collection_membership(&r.organization_user_id, r.read_only != 0, r.hide_passwords != 0, r.manage != 0)
++        })
++        .collect();
++    Ok(Json(json!(items)))
++}
++
++/// PUT /api/organizations/{id}/collections/{cid}/users — set the collection's members (Owner/Admin).
++#[worker::send]
++pub async fn put_collection_users(
++    claims: Claims,
++    State(env): State<Arc<Env>>,
++    Path((org_id, collection_id)): Path<(String, String)>,
++    Json(payload): Json<PutCollectionUsersRequest>,
++) -> Result<Json<()>, AppError> {
++    let db = db::get_db(&env)?;
++    require_org_manage(&db, &claims.sub, &org_id).await?;
++
++    // Verify the collection belongs to the org.
++    let belongs: Option<IdRow> = d1_query!(
++        &db,
++        "SELECT id FROM collections WHERE id = ?1 AND organization_id = ?2",
++        collection_id,
++        org_id
++    )
++    .map_err(|_| AppError::Database)?
++    .first(None)
++    .await?;
++    belongs.ok_or_else(|| AppError::NotFound("Collection not found".to_string()))?;
++
++    d1_query!(
++        &db,
++        "DELETE FROM collection_users WHERE collection_id = ?1",
++        collection_id
++    )
++    .map_err(|_| AppError::Database)?
++    .run()
++    .await?;
++
++    for sel in &payload.users {
++        // sel.id here is an organization_user_id; verify it is in this org.
++        let in_org: Option<IdRow> = d1_query!(
++            &db,
++            "SELECT id FROM organization_users WHERE id = ?1 AND organization_id = ?2",
++            sel.id,
++            org_id
++        )
++        .map_err(|_| AppError::Database)?
++        .first(None)
++        .await?;
++        if in_org.is_none() {
++            continue;
++        }
++        d1_query!(
++            &db,
++            "INSERT INTO collection_users (collection_id, organization_user_id, read_only, hide_passwords, manage) \
++             VALUES (?1, ?2, ?3, ?4, ?5)",
++            collection_id,
++            sel.id,
++            sel.read_only,
++            sel.hide_passwords,
++            sel.manage
++        )
++        .map_err(|_| AppError::Database)?
++        .run()
++        .await?;
++    }
++    Ok(Json(()))
++}
 diff --git a/src/handlers/sync.rs b/src/handlers/sync.rs
-index 50f5452..8732066 100644
+index 50f5452..1fc4b7f 100644
 --- a/src/handlers/sync.rs
 +++ b/src/handlers/sync.rs
 @@ -7,7 +7,7 @@ use crate::{
@@ -653,7 +1843,7 @@ index 50f5452..8732066 100644
      let folders_json = serde_json::to_string(&folders).map_err(|_| AppError::Internal)?;
  
      // Build response JSON via string concatenation (ciphers already raw JSON)
-@@ -123,7 +128,9 @@ pub async fn get_sync_data(
+@@ -123,12 +128,22 @@ pub async fn get_sync_data(
      response.push_str(&profile_json);
      response.push_str(",\"folders\":");
      response.push_str(&folders_json);
@@ -661,9 +1851,41 @@ index 50f5452..8732066 100644
 +    response.push_str(",\"collections\":");
 +    response.push_str(&collections_json);
 +    response.push_str(",\"policies\":[],\"ciphers\":");
++    // Personal ciphers + org ciphers the user can access:
++    //  - owner/admin (atype<=1) see every cipher in their confirmed orgs
++    //  - regular members see ciphers in collections they're assigned to
      ciphers::append_cipher_json_array_raw(
          &mut response,
          &db,
+         include_attachments,
+-        "WHERE c.user_id = ?1",
++        "WHERE c.user_id = ?1 \
++         OR c.organization_id IN (SELECT organization_id FROM organization_users WHERE user_id = ?1 AND status = 2 AND atype <= 1) \
++         OR c.id IN (SELECT cc.cipher_id FROM collection_ciphers cc \
++                     JOIN collection_users cu ON cu.collection_id = cc.collection_id \
++                     JOIN organization_users ou ON ou.id = cu.organization_user_id \
++                     WHERE ou.user_id = ?1 AND ou.status = 2)",
+         &[user_id.clone().into()],
+         "",
+         force_row_query,
+diff --git a/src/models/cipher.rs b/src/models/cipher.rs
+index 4a8b289..c0ba8ce 100644
+--- a/src/models/cipher.rs
++++ b/src/models/cipher.rs
+@@ -206,7 +206,12 @@ impl From<CipherDBModel> for Cipher {
+     fn from(val: CipherDBModel) -> Self {
+         Cipher {
+             id: val.id,
+-            user_id: Some(val.user_id),
++            // Empty user_id marks an org-owned cipher (NULL in the DB, coalesced to "").
++            user_id: if val.user_id.is_empty() {
++                None
++            } else {
++                Some(val.user_id)
++            },
+             organization_id: val.organization_id,
+             r#type: val.r#type,
+             data: serde_json::from_str(&val.data).unwrap_or_default(),
 diff --git a/src/models/mod.rs b/src/models/mod.rs
 index 9a36d52..f767ae2 100644
 --- a/src/models/mod.rs
@@ -678,10 +1900,10 @@ index 9a36d52..f767ae2 100644
  pub mod twofactor;
 diff --git a/src/models/organization.rs b/src/models/organization.rs
 new file mode 100644
-index 0000000..938ca56
+index 0000000..a9d202e
 --- /dev/null
 +++ b/src/models/organization.rs
-@@ -0,0 +1,210 @@
+@@ -0,0 +1,331 @@
 +use serde::Deserialize;
 +use serde_json::{json, Value};
 +
@@ -769,6 +1991,83 @@ index 0000000..938ca56
 +    pub name: String,
 +    #[serde(default)]
 +    pub external_id: Option<String>,
++    /// Members assigned to this collection (web vault sends these on create/update).
++    #[serde(default)]
++    pub users: Vec<CollectionAccessSelection>,
++}
++
++/// One collection's access flags for a member (used in invite + collection assignment).
++#[derive(Debug, Clone, Deserialize)]
++#[serde(rename_all = "camelCase")]
++pub struct CollectionAccessSelection {
++    pub id: String,
++    #[serde(default)]
++    pub read_only: bool,
++    #[serde(default)]
++    pub hide_passwords: bool,
++    #[serde(default)]
++    pub manage: bool,
++}
++
++#[derive(Debug, Deserialize)]
++#[serde(rename_all = "camelCase")]
++pub struct InviteUsersRequest {
++    pub emails: Vec<String>,
++    #[serde(rename = "type")]
++    pub atype: i64,
++    #[serde(default)]
++    pub collections: Vec<CollectionAccessSelection>,
++    // access_all = "member can see every collection without explicit assignment".
++    // Phase 3 (needs a membership column); owners/admins already see all via atype.
++    #[allow(dead_code)]
++    #[serde(default)]
++    pub access_all: bool,
++}
++
++#[derive(Debug, Deserialize)]
++#[serde(rename_all = "camelCase")]
++pub struct ConfirmUserRequest {
++    /// The org symmetric key wrapped with the confirmed member's RSA public key.
++    pub key: String,
++}
++
++#[derive(Debug, Deserialize)]
++#[serde(rename_all = "camelCase")]
++pub struct AcceptInviteRequest {
++    // Email-link accept token; unused in manual-confirm mode (invites appear in the
++    // invited user's own sync, so no out-of-band token is required).
++    #[allow(dead_code)]
++    #[serde(default)]
++    pub token: Option<String>,
++}
++
++#[derive(Debug, Deserialize)]
++#[serde(rename_all = "camelCase")]
++pub struct UpdateOrgUserRequest {
++    #[serde(rename = "type")]
++    pub atype: i64,
++    #[serde(default)]
++    pub collections: Vec<CollectionAccessSelection>,
++    // access_all = "member can see every collection without explicit assignment".
++    // Phase 3 (needs a membership column); owners/admins already see all via atype.
++    #[allow(dead_code)]
++    #[serde(default)]
++    pub access_all: bool,
++}
++
++#[derive(Debug, Deserialize)]
++#[serde(rename_all = "camelCase")]
++pub struct UpdateOrganizationRequest {
++    pub name: String,
++    #[serde(default)]
++    pub billing_email: Option<String>,
++}
++
++#[derive(Debug, Deserialize)]
++#[serde(rename_all = "camelCase")]
++pub struct PutCollectionUsersRequest {
++    #[serde(default)]
++    pub users: Vec<CollectionAccessSelection>,
 +}
 +
 +// ---- Response builders (Bitwarden-compatible JSON) ----
@@ -870,6 +2169,50 @@ index 0000000..938ca56
 +    })
 +}
 +
++/// One `{id, readOnly, hidePasswords, manage}` collection-access entry.
++pub fn collection_membership(
++    collection_id: &str,
++    read_only: bool,
++    hide_passwords: bool,
++    manage: bool,
++) -> Value {
++    json!({
++        "id": collection_id,
++        "readOnly": read_only,
++        "hidePasswords": hide_passwords,
++        "manage": manage,
++    })
++}
++
++/// `organizationUserUserDetails` — a member row in GET /api/organizations/{id}/users.
++#[allow(clippy::too_many_arguments)]
++pub fn org_user_details(
++    id: &str,
++    user_id: &Option<String>,
++    name: &Option<String>,
++    email: &str,
++    atype: i64,
++    status: i64,
++    collections: Vec<Value>,
++) -> Value {
++    json!({
++        "id": id,
++        "userId": user_id,
++        "name": name,
++        "email": email,
++        "type": atype,
++        "status": status,
++        "accessAll": false,
++        "twoFactorEnabled": false,
++        "resetPasswordEnrolled": false,
++        "ssoBound": false,
++        "hasMasterPassword": true,
++        "collections": collections,
++        "groups": [],
++        "object": "organizationUserUserDetails",
++    })
++}
++
 +/// `collectionDetails` object embedded in GET /api/sync `collections`.
 +/// `manage`/`read_only`/`hide_passwords` reflect this user's access to the collection.
 +pub fn collection_details(
@@ -893,7 +2236,7 @@ index 0000000..938ca56
 +    })
 +}
 diff --git a/src/router.rs b/src/router.rs
-index 5cab746..92bbc32 100644
+index 5cab746..1152ecb 100644
 --- a/src/router.rs
 +++ b/src/router.rs
 @@ -7,7 +7,7 @@ use worker::Env;
@@ -905,7 +2248,25 @@ index 5cab746..92bbc32 100644
  };
  
  pub fn api_router(env: Env) -> Router {
-@@ -195,6 +195,33 @@ pub fn api_router(env: Env) -> Router {
+@@ -161,6 +161,17 @@ pub fn api_router(env: Env) -> Router {
+             "/api/ciphers/unarchive",
+             put(ciphers::unarchive_ciphers_bulk),
+         )
++        // Share a personal cipher into an organization + set its collections
++        .route("/api/ciphers/{id}/share", put(ciphers::share_cipher))
++        .route("/api/ciphers/{id}/share", post(ciphers::share_cipher))
++        .route(
++            "/api/ciphers/{id}/collections",
++            put(ciphers::set_cipher_collections),
++        )
++        .route(
++            "/api/ciphers/{id}/collections",
++            post(ciphers::set_cipher_collections),
++        )
+         // Move ciphers to folder
+         .route("/api/ciphers/move", post(ciphers::move_cipher_selected))
+         .route("/api/ciphers/move", put(ciphers::move_cipher_selected))
+@@ -195,6 +206,80 @@ pub fn api_router(env: Env) -> Router {
              "/api/sends/{send_id}/access/file/{file_id}",
              post(sends::access_file_send),
          )
@@ -913,7 +2274,54 @@ index 5cab746..92bbc32 100644
 +        .route("/api/organizations", post(organizations::create_organization))
 +        .route(
 +            "/api/organizations/{id}",
-+            get(organizations::get_organization),
++            get(organizations::get_organization)
++                .put(organizations::update_organization)
++                .delete(organizations::delete_organization),
++        )
++        .route(
++            "/api/organizations/{id}/keys",
++            get(organizations::get_organization_keys),
++        )
++        .route(
++            "/api/organizations/{id}/leave",
++            post(organizations::leave_organization),
++        )
++        // Organization members
++        .route(
++            "/api/organizations/{id}/users",
++            get(organizations::list_org_users),
++        )
++        .route(
++            "/api/organizations/{id}/users/invite",
++            post(organizations::invite_users),
++        )
++        .route(
++            "/api/organizations/{id}/users/{ouid}",
++            get(organizations::get_org_user)
++                .put(organizations::update_org_user)
++                .delete(organizations::remove_org_user),
++        )
++        .route(
++            "/api/organizations/{id}/users/{ouid}/delete",
++            post(organizations::remove_org_user),
++        )
++        .route(
++            "/api/organizations/{id}/users/{ouid}/accept",
++            post(organizations::accept_invite),
++        )
++        .route(
++            "/api/organizations/{id}/users/{ouid}/confirm",
++            post(organizations::confirm_user),
++        )
++        // Per-collection member assignment
++        .route(
++            "/api/organizations/{id}/collections/{cid}/users",
++            get(organizations::get_collection_users).put(organizations::put_collection_users),
++        )
++        // A user's public key (admin client wraps the org key with it on confirm)
++        .route(
++            "/api/users/{id}/public-key",
++            get(organizations::get_user_public_key),
 +        )
 +        .route(
 +            "/api/organizations/{id}/collections",

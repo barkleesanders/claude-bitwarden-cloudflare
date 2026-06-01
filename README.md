@@ -44,7 +44,7 @@ Running cost: **$0/year** (Cloudflare free tier; you already own the domain). He
 | 250 | $12,000 | $24,000 | ~$0–$60 | **$12k–24k** |
 | 1,000 | $48,000 | $96,000 | ~$60–$600 | **$47k–95k** |
 
-**Honest limit:** base warden-worker is **personal-vault only**. An optional clean-room patch ([`patches/organizations.md`](patches/organizations.md)) adds the **Organizations + Collections** data model and endpoints — **Phase 1 landed** (create orgs/collections, sync), but **multi-user invites + sharing are Phase 2 (not functional yet)**. So today this is still *"a free, sovereign personal vault for everyone,"* **not yet** a 1Password-Business *team-sharing* replacement. Said up front on purpose.
+**Organizations + sharing:** base warden-worker is personal-vault only, but an optional **working** clean-room patch ([`patches/organizations.md`](patches/organizations.md)) adds **Organizations, shared Collections, member invites, and cipher sharing** — ACL-enforced, Cloudflare-native invites (manual-confirm, no external email), builds clean. So this **can** be a team-sharing setup, not just a personal vault. Still deferred (enterprise extras, not needed for sharing): SSO/SCIM, Groups, policies, event logs. Said up front on purpose.
 
 ---
 
@@ -81,8 +81,8 @@ Prefer manual? See [`docs/INSTALL.md`](docs/INSTALL.md).
 
 ## What works / what doesn't
 **Works:** logins, folders, TOTP, attachments (KV/R2), Bitwarden Send, device management, live sync/push, equivalent-domain matching, HIBP breach checks, 2FA (authenticator app), and the added **API key / `bw login --apikey`**. All official Bitwarden clients.
-**Partial (optional patch):** Organizations + Collections — Phase 1 (own orgs/collections + sync) works and compiles clean; **multi-user invites/sharing is Phase 2, not done yet** ([details](patches/organizations.md)).
-**Doesn't:** multi-member org sharing (Phase 2), SSO, Travel Mode, Watchtower dashboards. Personal-vault engine today, not an enterprise suite.
+**Works (optional patch):** Organizations, shared Collections, member invites + confirm, cipher sharing — ACL-enforced, Cloudflare-native invites ([details](patches/organizations.md)).
+**Doesn't:** SSO/SCIM, Groups, org policies, event logs, Travel Mode, Watchtower dashboards. Not a full enterprise suite — but real team sharing works.
 
 ## Security defaults this playbook sets
 - **`ALLOWED_EMAILS`** — only your address can register (the endpoint is public, but locked to you)

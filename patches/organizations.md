@@ -1,15 +1,15 @@
-# The Organizations patch (Phase 1)
+# The Organizations patch
 
-`warden-worker` ships as a **personal-vault** engine — it has no Organizations or shared
-Collections. This optional patch adds them, **clean-room** (implemented from the public Bitwarden
-API contract + official-client behavior — **no Vaultwarden/AGPL code**), so the repo stays MIT.
+`warden-worker` ships as a **personal-vault** engine — no Organizations or shared Collections.
+This optional patch adds a **working** Organizations + shared-Collections + member-sharing feature,
+implemented **clean-room** from the public Bitwarden API contract + official-client behavior
+(**no Vaultwarden/AGPL code**), so the repo stays MIT.
 
-Why it's possible on Cloudflare Workers at all: **all organization crypto is client-side.** When you
-add a member, an existing member's client wraps the Organization Symmetric Key with the new member's
-RSA public key and uploads that blob ([Bitwarden whitepaper](https://bitwarden.com/help/bitwarden-security-white-paper/)).
-The server only stores encrypted blobs and enforces access — pure CRUD + ACL, which is exactly what
-D1 + Workers do. warden-worker's sync protocol already declared the (empty) `organizations` field;
-this fills it in.
+Why it works on Cloudflare Workers: **all organization crypto is client-side.** When you add a
+member, an existing member's client wraps the Organization Symmetric Key with the new member's RSA
+public key and uploads that blob ([Bitwarden whitepaper](https://bitwarden.com/help/bitwarden-security-white-paper/)).
+The server only stores encrypted blobs + per-member wrapped keys and enforces access — pure CRUD +
+ACL, which is exactly what D1 + Workers do.
 
 ## Apply it (after the API-key patch)
 
@@ -20,49 +20,83 @@ git apply ../claude-bitwarden-cloudflare/patches/organizations.patch
 cp ../claude-bitwarden-cloudflare/patches/0015_add_organizations.sql migrations/0015_add_organizations.sql
 ```
 
-It applies cleanly on top of `api-key.patch` (verified) and builds with `worker-build --release`
-(0 errors, 0 clippy warnings).
+Verified: applies cleanly on top of `api-key.patch`; builds with `worker-build --release`
+(0 errors, 0 clippy warnings). ~2,100 insertions across 10 files.
 
-## What Phase 1 adds (8 files, ~843 insertions)
+## What it adds (full working flow)
 
-| File | Change |
-|---|---|
-| `migrations/0015_add_organizations.sql` | 5 tables: `organizations`, `organization_users`, `collections`, `collection_users`, `collection_ciphers` |
-| `sql/schema.sql` | same tables for fresh installs |
-| `src/models/organization.rs` | DB structs, request DTOs, Bitwarden-contract JSON builders |
-| `src/handlers/organizations.rs` | create-org, get-org, collections CRUD, sync helpers, ACL gate |
-| `src/handlers/sync.rs` | fills `profile.organizations` + `collections` in `GET /api/sync` |
-| `src/router.rs` | routes the org + collection endpoints |
-| `src/{handlers,models}/mod.rs` | module registration |
+- **Create / edit / delete organizations**, leave an org, fetch org keys.
+- **Members:** invite by email, accept, **confirm** (admin stores the member-wrapped org key),
+  change member type, remove. Last-owner protection on remove/demote/leave.
+- **Collections:** create/rename/delete, plus **per-collection member assignment** with
+  read-only / hide-passwords / manage flags.
+- **Cipher sharing:** move a personal cipher into an org (`/share`), set a cipher's collections,
+  create ciphers directly in an org. Org ciphers are **org-owned** (`user_id` NULL) and reached via
+  collection membership.
+- **ACL-enforced everything:** sync, read, edit, and delete of org ciphers respect membership +
+  per-collection access; owners/admins see all org ciphers, regular members see only their
+  collections.
+- **`GET /api/users/{id}/public-key`** so the admin client can wrap the org key on confirm.
 
-**Endpoints:** `POST /api/organizations`, `GET /api/organizations/{id}`,
-`GET|POST /api/organizations/{id}/collections`, `PUT|POST|DELETE /api/organizations/{id}/collections/{cid}`,
-`GET /api/collections`.
+### Endpoints
+
+```
+POST   /api/organizations                              create
+GET    /api/organizations/{id}                         profile (members)
+PUT    /api/organizations/{id}                          edit (owner)
+DELETE /api/organizations/{id}                          delete (owner)
+GET    /api/organizations/{id}/keys                     org keypair (members)
+POST   /api/organizations/{id}/leave                    leave
+GET    /api/organizations/{id}/users                    list members
+POST   /api/organizations/{id}/users/invite             invite by email (owner/admin)
+GET    /api/organizations/{id}/users/{ouid}             member detail
+PUT    /api/organizations/{id}/users/{ouid}             change type + collections
+DELETE /api/organizations/{id}/users/{ouid}             remove member
+POST   /api/organizations/{id}/users/{ouid}/accept      invited user accepts
+POST   /api/organizations/{id}/users/{ouid}/confirm     admin confirms (stores wrapped key)
+GET|POST|PUT|DELETE /api/organizations/{id}/collections[/{cid}]    collections CRUD
+GET|PUT /api/organizations/{id}/collections/{cid}/users           member assignment
+GET    /api/collections                                 all the caller's collections
+PUT|POST /api/ciphers/{id}/share                        move a personal cipher into an org
+PUT|POST /api/ciphers/{id}/collections                  set an org cipher's collections
+GET    /api/users/{id}/public-key
+```
+
+## Cloudflare-native invites (no external email required)
+
+Cloudflare's free tier can't reliably send arbitrary outbound email (the MailChannels integration
+ended; Email Routing's `send_email` binding only delivers to *verified* destinations). So invites
+default to **manual-confirm**, which needs no email at all:
+
+1. Admin invites an email that **already has an account on this vault**. In manual mode
+   (`ORG_AUTO_ACCEPT_INVITES` defaults to `true`) the membership is created as **Accepted**.
+2. The org appears in that user's own vault on their next sync.
+3. Admin **confirms** the member (their client wraps the org key with the member's public key).
+
+Set `ORG_AUTO_ACCEPT_INVITES="false"` to require the invited user to explicitly **accept** first
+(the standard Invited → Accepted → Confirmed flow). Wiring real outbound notification email would
+require an external provider (e.g. Resend) or Email Routing with verified destinations — optional,
+not required for the flow to work.
 
 ## Security model
 
-- Every org endpoint goes through `require_org_member` (you must have a membership row); collection
-  writes additionally require `require_org_manage` (Owner/Admin).
-- The server stores only: the org RSA keypair (private key already encrypted with the org symmetric
-  key) and, per member, the org symmetric key wrapped with that member's public key (`akey`). It
-  never sees plaintext keys.
+- Every org endpoint passes `require_org_member`; writes pass `require_org_manage` (Owner/Admin).
+- **Cross-org guards:** linking a cipher to a collection verifies the collection belongs to the
+  cipher's own org; assigning collections to a member ignores collections outside the org.
+- Org ciphers are stored org-owned (`user_id` NULL); read uses "member can access", edit/delete use
+  "member can manage" (owner/admin, or `manage` on a holding collection).
+- The server stores only the org RSA keypair (private key already encrypted with the org symmetric
+  key) and, per member, the org symmetric key wrapped with that member's public key. Never plaintext.
 
-## Status — be honest about what's NOT done yet
+## Genuinely deferred (not needed for orgs + shared collections to work)
 
-**Phase 1 = the data model + your own orgs/collections.** It lets you create an organization and
-collections and have them appear in sync. It does **not yet** do the thing orgs are *for*:
+Groups, SSO/SCIM, policies, event logs, admin reset-password, the `access_all` membership flag,
+outbound invite email, and org-cipher **archive/partial-field** edits (personal-vault features).
+None of these block the create-org → invite → confirm → share → use flow.
 
-- ❌ **Inviting other users / multi-member sharing** — Phase 2 (Cloudflare-native: the Workers Email
-  Routing `send_email` binding, plus a manual admin-confirm flow that needs no external email).
-- ❌ **Moving a cipher into a shared collection** (`/api/ciphers/{id}/share`) — Phase 2.
-- ❌ **Per-collection ACLs for non-owner members, Groups** — Phase 2/3.
+## Deploying it (additive + backward-compatible)
 
-So **until Phase 2 lands, treat the deployment as personal-vault.** Phase 1 is the foundation that
-proves orgs run on Workers and compiles clean — not a finished team-sharing feature.
-
-## Deploying it (it's additive + backward-compatible)
-
-The migration only **adds** tables; it changes nothing existing. Sync returns your same
-ciphers/folders/sends plus empty `organizations`/`collections` if you have no orgs. To go live you'd
-apply `0015` to your D1 and redeploy — see the repo README's deploy section. Not deploying changes
-nothing.
+The migration only **adds** tables; existing `users`/`ciphers`/`folders`/`sends` are untouched. Sync
+returns your same vault plus your orgs/collections (empty if you have none). To go live: apply
+`0015_add_organizations.sql` to your D1 and redeploy (see the repo README's deploy section). Not
+deploying changes nothing.
