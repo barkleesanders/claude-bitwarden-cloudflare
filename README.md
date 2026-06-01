@@ -44,7 +44,7 @@ Running cost: **$0/year** (Cloudflare free tier; you already own the domain). He
 | 250 | $12,000 | $24,000 | ~$0–$60 | **$12k–24k** |
 | 1,000 | $48,000 | $96,000 | ~$60–$600 | **$47k–95k** |
 
-**Honest limit:** warden-worker is **personal-vault only** — no Organizations or shared Collections. So at scale this is *"a free, sovereign personal vault for everyone,"* **not** a 1Password-Business *team-sharing* replacement. Shared team secrets still need a paid org tier. Said up front on purpose.
+**Honest limit:** base warden-worker is **personal-vault only**. An optional clean-room patch ([`patches/organizations.md`](patches/organizations.md)) adds the **Organizations + Collections** data model and endpoints — **Phase 1 landed** (create orgs/collections, sync), but **multi-user invites + sharing are Phase 2 (not functional yet)**. So today this is still *"a free, sovereign personal vault for everyone,"* **not yet** a 1Password-Business *team-sharing* replacement. Said up front on purpose.
 
 ---
 
@@ -81,7 +81,8 @@ Prefer manual? See [`docs/INSTALL.md`](docs/INSTALL.md).
 
 ## What works / what doesn't
 **Works:** logins, folders, TOTP, attachments (KV/R2), Bitwarden Send, device management, live sync/push, equivalent-domain matching, HIBP breach checks, 2FA (authenticator app), and the added **API key / `bw login --apikey`**. All official Bitwarden clients.
-**Doesn't:** Organizations, shared Collections, SSO, Travel Mode, Watchtower dashboards. Personal-vault engine, not an enterprise suite.
+**Partial (optional patch):** Organizations + Collections — Phase 1 (own orgs/collections + sync) works and compiles clean; **multi-user invites/sharing is Phase 2, not done yet** ([details](patches/organizations.md)).
+**Doesn't:** multi-member org sharing (Phase 2), SSO, Travel Mode, Watchtower dashboards. Personal-vault engine today, not an enterprise suite.
 
 ## Security defaults this playbook sets
 - **`ALLOWED_EMAILS`** — only your address can register (the endpoint is public, but locked to you)

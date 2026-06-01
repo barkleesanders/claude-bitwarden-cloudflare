@@ -1,0 +1,941 @@
+diff --git a/migrations/0015_add_organizations.sql b/migrations/0015_add_organizations.sql
+new file mode 100644
+index 0000000..67c0a26
+--- /dev/null
++++ b/migrations/0015_add_organizations.sql
+@@ -0,0 +1,63 @@
++-- Organizations + shared Collections (Phase 1)
++-- Clean-room implementation of the Bitwarden Organizations data model.
++-- All org crypto is client-side: the server only stores the org RSA keypair
++-- (private key already encrypted with the org symmetric key) and, per member,
++-- the org symmetric key wrapped with that member's RSA public key (akey).
++-- The server never sees plaintext keys.
++
++CREATE TABLE IF NOT EXISTS organizations (
++    id TEXT PRIMARY KEY NOT NULL,
++    name TEXT NOT NULL,                       -- org display name (plaintext, like Bitwarden)
++    billing_email TEXT NOT NULL DEFAULT '',
++    public_key TEXT NOT NULL,                 -- org RSA public key
++    private_key TEXT NOT NULL,                -- org RSA private key, encrypted with the org symmetric key
++    created_at TEXT NOT NULL,
++    updated_at TEXT NOT NULL
++);
++
++CREATE TABLE IF NOT EXISTS organization_users (
++    id TEXT PRIMARY KEY NOT NULL,
++    organization_id TEXT NOT NULL,
++    user_id TEXT,                             -- NULL while invited-by-email and not yet linked (Phase 2)
++    email TEXT NOT NULL,                      -- invited/member email
++    akey TEXT,                                -- org symmetric key wrapped with THIS member's RSA public key (NULL until confirmed)
++    status INTEGER NOT NULL DEFAULT 0,        -- 0=Invited, 1=Accepted, 2=Confirmed
++    atype INTEGER NOT NULL DEFAULT 2,         -- 0=Owner, 1=Admin, 2=User, 3=Manager
++    created_at TEXT NOT NULL,
++    updated_at TEXT NOT NULL,
++    FOREIGN KEY (organization_id) REFERENCES organizations(id) ON DELETE CASCADE,
++    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
++);
++CREATE INDEX IF NOT EXISTS idx_org_users_user ON organization_users(user_id);
++CREATE INDEX IF NOT EXISTS idx_org_users_org ON organization_users(organization_id);
++
++CREATE TABLE IF NOT EXISTS collections (
++    id TEXT PRIMARY KEY NOT NULL,
++    organization_id TEXT NOT NULL,
++    name TEXT NOT NULL,                       -- encrypted with the org symmetric key
++    external_id TEXT,
++    created_at TEXT NOT NULL,
++    updated_at TEXT NOT NULL,
++    FOREIGN KEY (organization_id) REFERENCES organizations(id) ON DELETE CASCADE
++);
++CREATE INDEX IF NOT EXISTS idx_collections_org ON collections(organization_id);
++
++CREATE TABLE IF NOT EXISTS collection_users (
++    collection_id TEXT NOT NULL,
++    organization_user_id TEXT NOT NULL,
++    read_only INTEGER NOT NULL DEFAULT 0,
++    hide_passwords INTEGER NOT NULL DEFAULT 0,
++    manage INTEGER NOT NULL DEFAULT 0,
++    PRIMARY KEY (collection_id, organization_user_id),
++    FOREIGN KEY (collection_id) REFERENCES collections(id) ON DELETE CASCADE,
++    FOREIGN KEY (organization_user_id) REFERENCES organization_users(id) ON DELETE CASCADE
++);
++
++CREATE TABLE IF NOT EXISTS collection_ciphers (
++    collection_id TEXT NOT NULL,
++    cipher_id TEXT NOT NULL,
++    PRIMARY KEY (collection_id, cipher_id),
++    FOREIGN KEY (collection_id) REFERENCES collections(id) ON DELETE CASCADE,
++    FOREIGN KEY (cipher_id) REFERENCES ciphers(id) ON DELETE CASCADE
++);
++CREATE INDEX IF NOT EXISTS idx_collection_ciphers_cipher ON collection_ciphers(cipher_id);
+diff --git a/sql/schema.sql b/sql/schema.sql
+index f8c4029..45a90ad 100644
+--- a/sql/schema.sql
++++ b/sql/schema.sql
+@@ -197,3 +197,66 @@ CREATE TABLE IF NOT EXISTS sends_pending (
+   disabled INTEGER NOT NULL DEFAULT 0,
+   hide_email INTEGER NOT NULL DEFAULT 0
+ );
++-- Organizations + shared Collections (Phase 1)
++-- Clean-room implementation of the Bitwarden Organizations data model.
++-- All org crypto is client-side: the server only stores the org RSA keypair
++-- (private key already encrypted with the org symmetric key) and, per member,
++-- the org symmetric key wrapped with that member's RSA public key (akey).
++-- The server never sees plaintext keys.
++
++CREATE TABLE IF NOT EXISTS organizations (
++    id TEXT PRIMARY KEY NOT NULL,
++    name TEXT NOT NULL,                       -- org display name (plaintext, like Bitwarden)
++    billing_email TEXT NOT NULL DEFAULT '',
++    public_key TEXT NOT NULL,                 -- org RSA public key
++    private_key TEXT NOT NULL,                -- org RSA private key, encrypted with the org symmetric key
++    created_at TEXT NOT NULL,
++    updated_at TEXT NOT NULL
++);
++
++CREATE TABLE IF NOT EXISTS organization_users (
++    id TEXT PRIMARY KEY NOT NULL,
++    organization_id TEXT NOT NULL,
++    user_id TEXT,                             -- NULL while invited-by-email and not yet linked (Phase 2)
++    email TEXT NOT NULL,                      -- invited/member email
++    akey TEXT,                                -- org symmetric key wrapped with THIS member's RSA public key (NULL until confirmed)
++    status INTEGER NOT NULL DEFAULT 0,        -- 0=Invited, 1=Accepted, 2=Confirmed
++    atype INTEGER NOT NULL DEFAULT 2,         -- 0=Owner, 1=Admin, 2=User, 3=Manager
++    created_at TEXT NOT NULL,
++    updated_at TEXT NOT NULL,
++    FOREIGN KEY (organization_id) REFERENCES organizations(id) ON DELETE CASCADE,
++    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
++);
++CREATE INDEX IF NOT EXISTS idx_org_users_user ON organization_users(user_id);
++CREATE INDEX IF NOT EXISTS idx_org_users_org ON organization_users(organization_id);
++
++CREATE TABLE IF NOT EXISTS collections (
++    id TEXT PRIMARY KEY NOT NULL,
++    organization_id TEXT NOT NULL,
++    name TEXT NOT NULL,                       -- encrypted with the org symmetric key
++    external_id TEXT,
++    created_at TEXT NOT NULL,
++    updated_at TEXT NOT NULL,
++    FOREIGN KEY (organization_id) REFERENCES organizations(id) ON DELETE CASCADE
++);
++CREATE INDEX IF NOT EXISTS idx_collections_org ON collections(organization_id);
++
++CREATE TABLE IF NOT EXISTS collection_users (
++    collection_id TEXT NOT NULL,
++    organization_user_id TEXT NOT NULL,
++    read_only INTEGER NOT NULL DEFAULT 0,
++    hide_passwords INTEGER NOT NULL DEFAULT 0,
++    manage INTEGER NOT NULL DEFAULT 0,
++    PRIMARY KEY (collection_id, organization_user_id),
++    FOREIGN KEY (collection_id) REFERENCES collections(id) ON DELETE CASCADE,
++    FOREIGN KEY (organization_user_id) REFERENCES organization_users(id) ON DELETE CASCADE
++);
++
++CREATE TABLE IF NOT EXISTS collection_ciphers (
++    collection_id TEXT NOT NULL,
++    cipher_id TEXT NOT NULL,
++    PRIMARY KEY (collection_id, cipher_id),
++    FOREIGN KEY (collection_id) REFERENCES collections(id) ON DELETE CASCADE,
++    FOREIGN KEY (cipher_id) REFERENCES ciphers(id) ON DELETE CASCADE
++);
++CREATE INDEX IF NOT EXISTS idx_collection_ciphers_cipher ON collection_ciphers(cipher_id);
+diff --git a/src/handlers/mod.rs b/src/handlers/mod.rs
+index 1c809c6..ab78d9b 100644
+--- a/src/handlers/mod.rs
++++ b/src/handlers/mod.rs
+@@ -10,6 +10,7 @@ pub mod folders;
+ pub mod identity;
+ pub mod import;
+ pub mod meta;
++pub mod organizations;
+ pub mod purge;
+ pub mod sends;
+ pub mod streaming;
+diff --git a/src/handlers/organizations.rs b/src/handlers/organizations.rs
+new file mode 100644
+index 0000000..1e6ef7e
+--- /dev/null
++++ b/src/handlers/organizations.rs
+@@ -0,0 +1,466 @@
++use axum::extract::{Path, State};
++use axum::Json;
++use serde::Deserialize;
++use serde_json::{json, Value};
++use std::sync::Arc;
++use uuid::Uuid;
++use worker::Env;
++
++use crate::auth::Claims;
++use crate::db::{self, touch_user_updated_at, Db};
++use crate::error::AppError;
++use crate::models::organization::{
++    collection_details, collection_response, organization_response, profile_organization,
++    Collection, CreateCollectionRequest, CreateOrganizationRequest, Organization, OrganizationUser,
++    STATUS_CONFIRMED, TYPE_ADMIN, TYPE_OWNER,
++};
++use crate::d1_query;
++
++// ============================================================================
++// ACL helpers
++// ============================================================================
++
++/// Return this user's confirmed membership in `org_id`, or an error if they are
++/// not a member. This is the access boundary for every organization endpoint.
++pub async fn require_org_member(
++    db: &Db,
++    user_id: &str,
++    org_id: &str,
++) -> Result<OrganizationUser, AppError> {
++    let member: Option<OrganizationUser> = d1_query!(
++        db,
++        "SELECT * FROM organization_users WHERE organization_id = ?1 AND user_id = ?2",
++        org_id,
++        user_id
++    )
++    .map_err(|_| AppError::Database)?
++    .first(None)
++    .await?;
++
++    member.ok_or_else(|| AppError::NotFound("Organization not found".to_string()))
++}
++
++/// Require that the user can manage the organization's collections (Owner or Admin).
++async fn require_org_manage(
++    db: &Db,
++    user_id: &str,
++    org_id: &str,
++) -> Result<OrganizationUser, AppError> {
++    let member = require_org_member(db, user_id, org_id).await?;
++    if member.atype <= TYPE_ADMIN {
++        Ok(member)
++    } else {
++        Err(AppError::Unauthorized(
++            "You do not have permission to manage this organization".to_string(),
++        ))
++    }
++}
++
++// ============================================================================
++// Sync helpers (called from handlers::sync)
++// ============================================================================
++
++#[derive(Debug, Deserialize)]
++struct ProfileOrgRow {
++    org_name: String,
++    id: String,
++    organization_id: String,
++    user_id: Option<String>,
++    email: String,
++    akey: Option<String>,
++    status: i64,
++    atype: i64,
++    created_at: String,
++    updated_at: String,
++}
++
++/// Build the `profile.organizations` array for GET /api/sync.
++pub async fn build_profile_organizations(
++    db: &Db,
++    user_id: &str,
++) -> Result<Vec<Value>, AppError> {
++    let rows: Vec<ProfileOrgRow> = d1_query!(
++        db,
++        "SELECT o.name AS org_name, ou.id AS id, ou.organization_id AS organization_id, \
++                ou.user_id AS user_id, ou.email AS email, ou.akey AS akey, \
++                ou.status AS status, ou.atype AS atype, \
++                ou.created_at AS created_at, ou.updated_at AS updated_at \
++         FROM organization_users ou JOIN organizations o ON o.id = ou.organization_id \
++         WHERE ou.user_id = ?1",
++        user_id
++    )
++    .map_err(|_| AppError::Database)?
++    .all()
++    .await?
++    .results()
++    .map_err(|_| AppError::Database)?;
++
++    Ok(rows
++        .into_iter()
++        .map(|r| {
++            let org_id = r.organization_id.clone();
++            let org_name = r.org_name.clone();
++            let member = OrganizationUser {
++                id: r.id,
++                organization_id: r.organization_id,
++                user_id: r.user_id,
++                email: r.email,
++                akey: r.akey,
++                status: r.status,
++                atype: r.atype,
++                created_at: r.created_at,
++                updated_at: r.updated_at,
++            };
++            profile_organization(&org_id, &org_name, &member)
++        })
++        .collect())
++}
++
++#[derive(Debug, Deserialize)]
++struct UserCollectionRow {
++    id: String,
++    organization_id: String,
++    name: String,
++    external_id: Option<String>,
++    atype: i64,
++}
++
++/// Build the `collections` array (collectionDetails) for GET /api/sync.
++///
++/// Phase 1: a user is always an Owner of orgs they create, so they `manage` every
++/// collection. When non-owner members + per-collection ACLs land (Phase 2) the
++/// flags are read from `collection_users` instead of derived from member type.
++pub async fn build_user_collections(db: &Db, user_id: &str) -> Result<Vec<Value>, AppError> {
++    let rows: Vec<UserCollectionRow> = d1_query!(
++        db,
++        "SELECT c.id AS id, c.organization_id AS organization_id, c.name AS name, \
++                c.external_id AS external_id, ou.atype AS atype \
++         FROM collections c \
++         JOIN organization_users ou ON ou.organization_id = c.organization_id \
++         WHERE ou.user_id = ?1 AND ou.status = ?2",
++        user_id,
++        STATUS_CONFIRMED
++    )
++    .map_err(|_| AppError::Database)?
++    .all()
++    .await?
++    .results()
++    .map_err(|_| AppError::Database)?;
++
++    Ok(rows
++        .into_iter()
++        .map(|r| {
++            let manage = r.atype <= TYPE_ADMIN;
++            collection_details(
++                &r.id,
++                &r.organization_id,
++                &r.name,
++                &r.external_id,
++                false,
++                false,
++                manage,
++            )
++        })
++        .collect())
++}
++
++// ============================================================================
++// Organization endpoints
++// ============================================================================
++
++#[derive(Debug, Deserialize)]
++struct EmailRow {
++    email: String,
++}
++
++/// POST /api/organizations — create a new organization owned by the caller.
++#[worker::send]
++pub async fn create_organization(
++    claims: Claims,
++    State(env): State<Arc<Env>>,
++    Json(payload): Json<CreateOrganizationRequest>,
++) -> Result<Json<Value>, AppError> {
++    let db = db::get_db(&env)?;
++    let now = db::now_string();
++    let user_id = claims.sub.clone();
++
++    let keys = payload
++        .keys
++        .ok_or_else(|| AppError::BadRequest("Organization keys are required".to_string()))?;
++
++    // Caller's email is used as the membership email + default billing email.
++    let email_row: EmailRow = d1_query!(&db, "SELECT email FROM users WHERE id = ?1", user_id)
++        .map_err(|_| AppError::Database)?
++        .first(None)
++        .await?
++        .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
++    let billing_email = if payload.billing_email.is_empty() {
++        email_row.email.clone()
++    } else {
++        payload.billing_email.clone()
++    };
++
++    let org = Organization {
++        id: Uuid::new_v4().to_string(),
++        name: payload.name,
++        billing_email,
++        public_key: keys.public_key,
++        private_key: keys.encrypted_private_key,
++        created_at: now.clone(),
++        updated_at: now.clone(),
++    };
++
++    d1_query!(
++        &db,
++        "INSERT INTO organizations (id, name, billing_email, public_key, private_key, created_at, updated_at) \
++         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
++        org.id,
++        org.name,
++        org.billing_email,
++        org.public_key,
++        org.private_key,
++        org.created_at,
++        org.updated_at
++    )
++    .map_err(|_| AppError::Database)?
++    .run()
++    .await?;
++
++    // Owner membership: confirmed, holds the user-wrapped org key.
++    let owner_membership_id = Uuid::new_v4().to_string();
++    d1_query!(
++        &db,
++        "INSERT INTO organization_users (id, organization_id, user_id, email, akey, status, atype, created_at, updated_at) \
++         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
++        owner_membership_id,
++        org.id,
++        user_id,
++        email_row.email,
++        payload.key,
++        STATUS_CONFIRMED,
++        TYPE_OWNER,
++        now,
++        now
++    )
++    .map_err(|_| AppError::Database)?
++    .run()
++    .await?;
++
++    // Default collection (the client sends its encrypted name).
++    if let Some(collection_name) = payload.collection_name {
++        let collection_id = Uuid::new_v4().to_string();
++        d1_query!(
++            &db,
++            "INSERT INTO collections (id, organization_id, name, external_id, created_at, updated_at) \
++             VALUES (?1, ?2, ?3, NULL, ?4, ?5)",
++            collection_id,
++            org.id,
++            collection_name,
++            now,
++            now
++        )
++        .map_err(|_| AppError::Database)?
++        .run()
++        .await?;
++
++        d1_query!(
++            &db,
++            "INSERT INTO collection_users (collection_id, organization_user_id, read_only, hide_passwords, manage) \
++             VALUES (?1, ?2, 0, 0, 1)",
++            collection_id,
++            owner_membership_id
++        )
++        .map_err(|_| AppError::Database)?
++        .run()
++        .await?;
++    }
++
++    touch_user_updated_at(&db, &user_id, &now).await?;
++
++    Ok(Json(organization_response(&org, TYPE_OWNER)))
++}
++
++/// GET /api/organizations/{id} — organization profile (members only).
++#[worker::send]
++pub async fn get_organization(
++    claims: Claims,
++    State(env): State<Arc<Env>>,
++    Path(org_id): Path<String>,
++) -> Result<Json<Value>, AppError> {
++    let db = db::get_db(&env)?;
++    let member = require_org_member(&db, &claims.sub, &org_id).await?;
++
++    let org: Organization = d1_query!(&db, "SELECT * FROM organizations WHERE id = ?1", org_id)
++        .map_err(|_| AppError::Database)?
++        .first(None)
++        .await?
++        .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
++
++    Ok(Json(organization_response(&org, member.atype)))
++}
++
++// ============================================================================
++// Collection endpoints
++// ============================================================================
++
++fn collection_list(items: Vec<Value>) -> Value {
++    json!({ "data": items, "object": "list", "continuationToken": Value::Null })
++}
++
++/// GET /api/organizations/{id}/collections — collections in an org (members only).
++#[worker::send]
++pub async fn list_org_collections(
++    claims: Claims,
++    State(env): State<Arc<Env>>,
++    Path(org_id): Path<String>,
++) -> Result<Json<Value>, AppError> {
++    let db = db::get_db(&env)?;
++    require_org_member(&db, &claims.sub, &org_id).await?;
++
++    let cols: Vec<Collection> = d1_query!(
++        &db,
++        "SELECT * FROM collections WHERE organization_id = ?1",
++        org_id
++    )
++    .map_err(|_| AppError::Database)?
++    .all()
++    .await?
++    .results()
++    .map_err(|_| AppError::Database)?;
++
++    let items = cols.iter().map(collection_response).collect();
++    Ok(Json(collection_list(items)))
++}
++
++/// GET /api/collections — every collection the caller can access, across all orgs.
++#[worker::send]
++pub async fn list_collections(
++    claims: Claims,
++    State(env): State<Arc<Env>>,
++) -> Result<Json<Value>, AppError> {
++    let db = db::get_db(&env)?;
++    let items = build_user_collections(&db, &claims.sub).await?;
++    Ok(Json(collection_list(items)))
++}
++
++/// POST /api/organizations/{id}/collections — create a collection (Owner/Admin).
++#[worker::send]
++pub async fn create_collection(
++    claims: Claims,
++    State(env): State<Arc<Env>>,
++    Path(org_id): Path<String>,
++    Json(payload): Json<CreateCollectionRequest>,
++) -> Result<Json<Value>, AppError> {
++    let db = db::get_db(&env)?;
++    let member = require_org_manage(&db, &claims.sub, &org_id).await?;
++    let now = db::now_string();
++
++    let col = Collection {
++        id: Uuid::new_v4().to_string(),
++        organization_id: org_id,
++        name: payload.name,
++        external_id: payload.external_id,
++        created_at: now.clone(),
++        updated_at: now.clone(),
++    };
++
++    d1_query!(
++        &db,
++        "INSERT INTO collections (id, organization_id, name, external_id, created_at, updated_at) \
++         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
++        col.id,
++        col.organization_id,
++        col.name,
++        col.external_id,
++        col.created_at,
++        col.updated_at
++    )
++    .map_err(|_| AppError::Database)?
++    .run()
++    .await?;
++
++    // Grant the creating member manage access to the new collection.
++    d1_query!(
++        &db,
++        "INSERT INTO collection_users (collection_id, organization_user_id, read_only, hide_passwords, manage) \
++         VALUES (?1, ?2, 0, 0, 1)",
++        col.id,
++        member.id
++    )
++    .map_err(|_| AppError::Database)?
++    .run()
++    .await?;
++
++    Ok(Json(collection_response(&col)))
++}
++
++/// PUT|POST /api/organizations/{id}/collections/{cid} — rename a collection (Owner/Admin).
++#[worker::send]
++pub async fn update_collection(
++    claims: Claims,
++    State(env): State<Arc<Env>>,
++    Path((org_id, collection_id)): Path<(String, String)>,
++    Json(payload): Json<CreateCollectionRequest>,
++) -> Result<Json<Value>, AppError> {
++    let db = db::get_db(&env)?;
++    require_org_manage(&db, &claims.sub, &org_id).await?;
++    let now = db::now_string();
++
++    let existing: Collection = d1_query!(
++        &db,
++        "SELECT * FROM collections WHERE id = ?1 AND organization_id = ?2",
++        collection_id,
++        org_id
++    )
++    .map_err(|_| AppError::Database)?
++    .first(None)
++    .await?
++    .ok_or_else(|| AppError::NotFound("Collection not found".to_string()))?;
++
++    let col = Collection {
++        id: existing.id,
++        organization_id: existing.organization_id,
++        name: payload.name,
++        external_id: payload.external_id,
++        created_at: existing.created_at,
++        updated_at: now,
++    };
++
++    d1_query!(
++        &db,
++        "UPDATE collections SET name = ?1, external_id = ?2, updated_at = ?3 WHERE id = ?4",
++        col.name,
++        col.external_id,
++        col.updated_at,
++        col.id
++    )
++    .map_err(|_| AppError::Database)?
++    .run()
++    .await?;
++
++    Ok(Json(collection_response(&col)))
++}
++
++/// DELETE /api/organizations/{id}/collections/{cid} — delete a collection (Owner/Admin).
++/// Cascades remove collection_users + collection_ciphers rows (ciphers themselves remain).
++#[worker::send]
++pub async fn delete_collection(
++    claims: Claims,
++    State(env): State<Arc<Env>>,
++    Path((org_id, collection_id)): Path<(String, String)>,
++) -> Result<Json<()>, AppError> {
++    let db = db::get_db(&env)?;
++    require_org_manage(&db, &claims.sub, &org_id).await?;
++
++    d1_query!(
++        &db,
++        "DELETE FROM collections WHERE id = ?1 AND organization_id = ?2",
++        collection_id,
++        org_id
++    )
++    .map_err(|_| AppError::Database)?
++    .run()
++    .await?;
++
++    Ok(Json(()))
++}
+diff --git a/src/handlers/sync.rs b/src/handlers/sync.rs
+index 50f5452..8732066 100644
+--- a/src/handlers/sync.rs
++++ b/src/handlers/sync.rs
+@@ -7,7 +7,7 @@ use crate::{
+     db,
+     error::AppError,
+     handlers::{
+-        attachments, ciphers, ciphers_default_row_query, domains, sends,
++        attachments, ciphers, ciphers_default_row_query, domains, organizations, sends,
+         sync_response_prealloc_bytes, two_factor_enabled,
+     },
+     models::{
+@@ -86,10 +86,15 @@ pub async fn get_sync_data(
+ 
+     // Serialize profile and folders (small data, acceptable CPU cost)
+     let mut profile = Profile::from_user(user, two_factor_enabled)?;
+-    // Match vaultwarden semantics: `_status` is `Invited` when no master password is set.
+-    // We don't implement org invitations, but this helps clients interpret the account state.
++    // `_status` is `Invited` when no master password is set; helps clients interpret account state.
+     profile.status = if has_master_password { 0 } else { 1 };
++    // Organizations the user is a member of (empty for users with no orgs).
++    profile.organizations = organizations::build_profile_organizations(&db, &user_id).await?;
+     let profile_json = serde_json::to_string(&profile).map_err(|_| AppError::Internal)?;
++
++    // Collections the user can access across all their orgs (collectionDetails objects).
++    let collections = organizations::build_user_collections(&db, &user_id).await?;
++    let collections_json = serde_json::to_string(&collections).map_err(|_| AppError::Internal)?;
+     let folders_json = serde_json::to_string(&folders).map_err(|_| AppError::Internal)?;
+ 
+     // Build response JSON via string concatenation (ciphers already raw JSON)
+@@ -123,7 +128,9 @@ pub async fn get_sync_data(
+     response.push_str(&profile_json);
+     response.push_str(",\"folders\":");
+     response.push_str(&folders_json);
+-    response.push_str(",\"collections\":[],\"policies\":[],\"ciphers\":");
++    response.push_str(",\"collections\":");
++    response.push_str(&collections_json);
++    response.push_str(",\"policies\":[],\"ciphers\":");
+     ciphers::append_cipher_json_array_raw(
+         &mut response,
+         &db,
+diff --git a/src/models/mod.rs b/src/models/mod.rs
+index 9a36d52..f767ae2 100644
+--- a/src/models/mod.rs
++++ b/src/models/mod.rs
+@@ -4,6 +4,7 @@ pub mod cipher;
+ pub mod device;
+ pub mod folder;
+ pub mod import;
++pub mod organization;
+ pub mod send;
+ pub mod sync;
+ pub mod twofactor;
+diff --git a/src/models/organization.rs b/src/models/organization.rs
+new file mode 100644
+index 0000000..938ca56
+--- /dev/null
++++ b/src/models/organization.rs
+@@ -0,0 +1,210 @@
++use serde::Deserialize;
++use serde_json::{json, Value};
++
++// ---- Membership status / type constants (Bitwarden contract) ----
++#[allow(dead_code)]
++pub const STATUS_INVITED: i64 = 0;
++#[allow(dead_code)]
++pub const STATUS_ACCEPTED: i64 = 1;
++pub const STATUS_CONFIRMED: i64 = 2;
++
++pub const TYPE_OWNER: i64 = 0;
++#[allow(dead_code)]
++pub const TYPE_ADMIN: i64 = 1;
++#[allow(dead_code)]
++pub const TYPE_USER: i64 = 2;
++#[allow(dead_code)]
++pub const TYPE_MANAGER: i64 = 3;
++
++// ---- DB row structs (field names must match column names) ----
++
++#[derive(Debug, Deserialize)]
++pub struct Organization {
++    pub id: String,
++    pub name: String,
++    pub billing_email: String,
++    pub public_key: String,
++    pub private_key: String,
++    pub created_at: String,
++    pub updated_at: String,
++}
++
++// Several fields are persisted now but first read in Phase 2 (invites/ACL):
++// organization_id, email, created_at, updated_at.
++#[allow(dead_code)]
++#[derive(Debug, Deserialize)]
++pub struct OrganizationUser {
++    pub id: String,
++    pub organization_id: String,
++    pub user_id: Option<String>,
++    pub email: String,
++    pub akey: Option<String>,
++    pub status: i64,
++    pub atype: i64,
++    pub created_at: String,
++    pub updated_at: String,
++}
++
++#[derive(Debug, Deserialize)]
++pub struct Collection {
++    pub id: String,
++    pub organization_id: String,
++    pub name: String,
++    pub external_id: Option<String>,
++    pub created_at: String,
++    pub updated_at: String,
++}
++
++// ---- Request DTOs (camelCase from official clients) ----
++
++#[derive(Debug, Deserialize)]
++#[serde(rename_all = "camelCase")]
++pub struct OrgKeysData {
++    pub public_key: String,
++    pub encrypted_private_key: String,
++}
++
++#[derive(Debug, Deserialize)]
++#[serde(rename_all = "camelCase")]
++pub struct CreateOrganizationRequest {
++    pub name: String,
++    #[serde(default)]
++    pub billing_email: String,
++    /// The org symmetric key wrapped with the creating user's RSA public key.
++    pub key: String,
++    /// The org RSA keypair (private key already encrypted with the org symmetric key).
++    pub keys: Option<OrgKeysData>,
++    /// Default collection name, encrypted with the org symmetric key.
++    #[serde(default)]
++    pub collection_name: Option<String>,
++}
++
++#[derive(Debug, Deserialize)]
++#[serde(rename_all = "camelCase")]
++pub struct CreateCollectionRequest {
++    pub name: String,
++    #[serde(default)]
++    pub external_id: Option<String>,
++}
++
++// ---- Response builders (Bitwarden-compatible JSON) ----
++
++/// `OrganizationResponseModel` returned from create/get organization.
++pub fn organization_response(org: &Organization, member_type: i64) -> Value {
++    json!({
++        "id": org.id,
++        "name": org.name,
++        "billingEmail": org.billing_email,
++        "businessName": Value::Null,
++        "key": Value::Null,
++        "object": "organization",
++        "enabled": true,
++        "type": member_type,
++        "status": STATUS_CONFIRMED,
++        "useGroups": false,
++        "useDirectory": false,
++        "useEvents": false,
++        "useTotp": true,
++        "use2fa": true,
++        "usersGetPremium": true,
++        "useApi": true,
++        "usePolicies": false,
++        "useSso": false,
++        "useResetPassword": false,
++        "selfHost": true,
++        "hasPublicAndPrivateKeys": true,
++        "seats": Value::Null,
++        "maxCollections": Value::Null,
++        "maxStorageGb": Value::Null,
++        "identifier": Value::Null,
++    })
++}
++
++/// `profileOrganization` entry embedded in GET /api/sync `profile.organizations`.
++pub fn profile_organization(org_id: &str, name: &str, member: &OrganizationUser) -> Value {
++    let is_owner = member.atype == TYPE_OWNER;
++    let is_admin = member.atype <= TYPE_ADMIN;
++    json!({
++        "id": org_id,
++        "name": name,
++        "key": member.akey,
++        "status": member.status,
++        "type": member.atype,
++        "enabled": true,
++        "object": "profileOrganization",
++        "userId": member.user_id,
++        "useGroups": false,
++        "useDirectory": false,
++        "useEvents": false,
++        "useTotp": true,
++        "use2fa": true,
++        "useApi": true,
++        "usePolicies": false,
++        "useSso": false,
++        "useKeyConnector": false,
++        "useScim": false,
++        "useResetPassword": false,
++        "usersGetPremium": true,
++        "selfHost": true,
++        "hasPublicAndPrivateKeys": true,
++        "resetPasswordEnrolled": false,
++        "seats": Value::Null,
++        "maxCollections": Value::Null,
++        "maxStorageGb": Value::Null,
++        "ssoBound": false,
++        "identifier": Value::Null,
++        "permissions": {
++            "accessEventLogs": is_admin,
++            "accessImportExport": is_admin,
++            "accessReports": is_admin,
++            "createNewCollections": is_admin,
++            "editAnyCollection": is_admin,
++            "deleteAnyCollection": is_admin,
++            "manageGroups": is_admin,
++            "managePolicies": is_owner,
++            "manageSso": is_owner,
++            "manageUsers": is_admin,
++            "manageResetPassword": is_owner,
++            "manageScim": is_owner
++        },
++        "providerId": Value::Null,
++        "providerName": Value::Null,
++        "familySponsorshipFriendlyName": Value::Null,
++        "keyConnectorEnabled": false,
++        "keyConnectorUrl": Value::Null,
++    })
++}
++
++/// `collection` object (GET /api/organizations/{id}/collections).
++pub fn collection_response(col: &Collection) -> Value {
++    json!({
++        "id": col.id,
++        "organizationId": col.organization_id,
++        "name": col.name,
++        "externalId": col.external_id,
++        "object": "collection",
++    })
++}
++
++/// `collectionDetails` object embedded in GET /api/sync `collections`.
++/// `manage`/`read_only`/`hide_passwords` reflect this user's access to the collection.
++pub fn collection_details(
++    id: &str,
++    organization_id: &str,
++    name: &str,
++    external_id: &Option<String>,
++    read_only: bool,
++    hide_passwords: bool,
++    manage: bool,
++) -> Value {
++    json!({
++        "id": id,
++        "organizationId": organization_id,
++        "name": name,
++        "externalId": external_id,
++        "readOnly": read_only,
++        "hidePasswords": hide_passwords,
++        "manage": manage,
++        "object": "collectionDetails",
++    })
++}
+diff --git a/src/router.rs b/src/router.rs
+index 5cab746..92bbc32 100644
+--- a/src/router.rs
++++ b/src/router.rs
+@@ -7,7 +7,7 @@ use worker::Env;
+ 
+ use crate::handlers::{
+     accounts, attachments, auth_requests, ciphers, config, devices, domains, emergency_access,
+-    folders, identity, import, meta, sends, sync, twofactor, webauth,
++    folders, identity, import, meta, organizations, sends, sync, twofactor, webauth,
+ };
+ 
+ pub fn api_router(env: Env) -> Router {
+@@ -195,6 +195,33 @@ pub fn api_router(env: Env) -> Router {
+             "/api/sends/{send_id}/access/file/{file_id}",
+             post(sends::access_file_send),
+         )
++        // Organizations + shared Collections
++        .route("/api/organizations", post(organizations::create_organization))
++        .route(
++            "/api/organizations/{id}",
++            get(organizations::get_organization),
++        )
++        .route(
++            "/api/organizations/{id}/collections",
++            get(organizations::list_org_collections),
++        )
++        .route(
++            "/api/organizations/{id}/collections",
++            post(organizations::create_collection),
++        )
++        .route(
++            "/api/organizations/{id}/collections/{cid}",
++            put(organizations::update_collection),
++        )
++        .route(
++            "/api/organizations/{id}/collections/{cid}",
++            post(organizations::update_collection),
++        )
++        .route(
++            "/api/organizations/{id}/collections/{cid}",
++            delete(organizations::delete_collection),
++        )
++        .route("/api/collections", get(organizations::list_collections))
+         .route("/api/config", get(config::config))
+         // Meta endpoints (mirrors a subset of vaultwarden core/mod.rs)
+         .route("/api/alive", get(meta::alive))
