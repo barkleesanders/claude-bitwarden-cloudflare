@@ -107,9 +107,17 @@ These go beyond "orgs + shared collections" — added on request, all compiling:
 - **Policies** — upsert/list/read org policies. `…/organizations/{id}/policies[/{type}]`.
 - **Event logs** — an audit trail of org admin actions (org/member/collection/group/policy
   mutations), readable by admins. `GET …/organizations/{id}/events`.
-- **Outbound invite email** — best-effort, **optional**. No-op unless you set
-  `EMAIL_PROVIDER_URL` + `EMAIL_API_KEY` (secret) + `EMAIL_FROM` (any Resend-compatible JSON
-  endpoint). Invites work fully without it (manual-confirm).
+- **Outbound invite email** — best-effort, **optional**, two transports (first configured wins):
+  1. **Gmail API** — send as a real Gmail / Google Workspace account. Set Worker **secrets**
+     `GMAIL_REFRESH_TOKEN`, `GMAIL_CLIENT_ID`, `GMAIL_CLIENT_SECRET` + a var `EMAIL_FROM` (the
+     authenticated account or a verified send-as alias). The Worker exchanges the refresh token
+     for a short-lived access token and calls `users.messages.send`. **Verified end-to-end**: an
+     invite triggered from the Admin Console produced a `messages.send` `HTTP 200` and the email
+     landed in the recipient's inbox.
+  2. **Resend-compatible endpoint** (fallback) — set `EMAIL_PROVIDER_URL` + `EMAIL_API_KEY`
+     (secret) + `EMAIL_FROM`.
+  No-op (and invites still work via manual-confirm) if neither is configured. **No credentials
+  live in this repo** — only the env-var *names*; you supply the secrets via `wrangler secret`.
 - **SCIM v2 provisioning** — bearer-token Users endpoints (`/scim/v2/{orgId}/Users`) for
   list/create/get/delete, plus token management (`…/organizations/{id}/scim/tokens`). Maps to org
   memberships.
@@ -172,11 +180,19 @@ Two more pieces make invites usable by *other people*:
    Set `DISABLE_USER_REGISTRATION="false"` so invitees see the **Create account** button — the
    endpoint still rejects anyone who isn't allowed-or-invited.
 
-2. **Outbound invite email is optional.** Set `EMAIL_PROVIDER_URL` (e.g. `https://api.resend.com/emails`),
-   `EMAIL_API_KEY` (a **Worker secret**, never in this repo), and `EMAIL_FROM` (a verified sender) to
-   email invitees a notification. **Without it, invites still work** — the org appears in the
-   invitee's vault on their next sync after they register, and an admin confirms them. This is the
-   "Cloudflare-native, no external service" default.
+2. **Outbound invite email is optional — and proven.** Easiest reliable transport is the **Gmail
+   API**: set Worker secrets `GMAIL_REFRESH_TOKEN` / `GMAIL_CLIENT_ID` / `GMAIL_CLIENT_SECRET` and a
+   var `EMAIL_FROM` (the authenticated Gmail/Workspace account, or a verified send-as alias). The
+   Worker mints a short-lived access token from the refresh token and calls `users.messages.send`;
+   invitees get a real notification from your address. (A Resend-compatible endpoint via
+   `EMAIL_PROVIDER_URL` + `EMAIL_API_KEY` is the fallback.) **All credentials are Worker secrets,
+   never in this repo.** **Without any of it, invites still work** — the org appears in the
+   invitee's vault after they register, and an admin confirms them.
+
+   > How to get a Gmail refresh token without a custom OAuth app: authorize the account once with a
+   > desktop OAuth client (e.g. the `gogcli` tool, or your own Google Cloud OAuth client with the
+   > `gmail.send`/`gmail.modify` scope), then store the resulting refresh token + client id/secret
+   > as the three Worker secrets above. The grant only needs send scope.
 
 **Flow without email:** invite → tell the person to open the vault and create an account → it links
 to their invite → they appear in your members list → you confirm them (their client wraps the org

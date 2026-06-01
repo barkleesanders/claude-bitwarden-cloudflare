@@ -1126,34 +1126,30 @@ index f155c55..5002e7e 100644
              'deletedDate', c.deleted_at,
 diff --git a/src/handlers/email.rs b/src/handlers/email.rs
 new file mode 100644
-index 0000000..5d93242
+index 0000000..f976d87
 --- /dev/null
 +++ b/src/handlers/email.rs
-@@ -0,0 +1,56 @@
+@@ -0,0 +1,179 @@
++use base64::{
++    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
++    Engine,
++};
 +use worker::{Env, Fetch, Headers, Method, Request, RequestInit};
 +
 +/// Best-effort outbound invite email.
 +///
-+/// Cloudflare's free tier can't reliably send arbitrary outbound mail, so invites
-+/// work fully without email (manual-confirm). If you want a notification, point these
-+/// at any Resend-compatible JSON endpoint:
-+///   EMAIL_PROVIDER_URL  e.g. https://api.resend.com/emails
-+///   EMAIL_API_KEY       bearer token (set as a Worker secret)
-+///   EMAIL_FROM          verified sender address
-+/// If any are missing this is a no-op — the invite still succeeds.
++/// Two transports are supported; the first one that's configured wins. If none are
++/// configured this is a no-op and the invite still succeeds (manual-confirm flow).
++///
++/// 1. **Gmail API** (send as a real Gmail / Google Workspace account):
++///    `GMAIL_REFRESH_TOKEN` OAuth refresh token (Worker secret),
++///    `GMAIL_CLIENT_ID` OAuth client id, `GMAIL_CLIENT_SECRET` OAuth client secret,
++///    `EMAIL_FROM` the authenticated account / a verified send-as alias.
++///
++/// 2. **Resend-compatible JSON endpoint** (fallback):
++///    `EMAIL_PROVIDER_URL` e.g. <https://api.resend.com/emails>,
++///    `EMAIL_API_KEY` bearer token (Worker secret), `EMAIL_FROM` verified sender.
 +pub async fn send_invite_email(env: &Env, to: &str, org_name: &str) {
-+    let url = match env.var("EMAIL_PROVIDER_URL") {
-+        Ok(v) => v.to_string(),
-+        Err(_) => return,
-+    };
-+    let api_key = match env
-+        .secret("EMAIL_API_KEY")
-+        .map(|s| s.to_string())
-+        .or_else(|_| env.var("EMAIL_API_KEY").map(|v| v.to_string()))
-+    {
-+        Ok(v) => v,
-+        Err(_) => return,
-+    };
 +    let from = env
 +        .var("EMAIL_FROM")
 +        .map(|v| v.to_string())
@@ -1165,6 +1161,133 @@ index 0000000..5d93242
 +         <p>Open your Bitwarden app, sign in, and accept the invitation. \
 +         An administrator will then confirm your access.</p>"
 +    );
++
++    // Prefer the Gmail API when a refresh token is configured.
++    if let Ok(refresh_token) = secret_or_var(env, "GMAIL_REFRESH_TOKEN") {
++        if send_via_gmail(env, &from, to, &subject, &html, &refresh_token).await {
++            return;
++        }
++        // Gmail failed — fall through to the Resend path if it's also configured.
++    }
++
++    send_via_resend(env, &from, to, &subject, &html).await;
++}
++
++/// Read a config value from a Worker secret first, then a plaintext var.
++fn secret_or_var(env: &Env, name: &str) -> Result<String, ()> {
++    env.secret(name)
++        .map(|s| s.to_string())
++        .or_else(|_| env.var(name).map(|v| v.to_string()))
++        .map_err(|_| ())
++}
++
++/// Minimal percent-encoding for application/x-www-form-urlencoded values
++/// (refresh tokens / client secrets can contain `/`, `+`, `=`, etc.).
++fn pct(s: &str) -> String {
++    let mut out = String::with_capacity(s.len());
++    for b in s.bytes() {
++        match b {
++            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
++                out.push(b as char)
++            }
++            _ => out.push_str(&format!("%{b:02X}")),
++        }
++    }
++    out
++}
++
++/// Exchange a refresh token for a short-lived access token (Google OAuth).
++async fn mint_gmail_access_token(env: &Env, refresh_token: &str) -> Option<String> {
++    let client_id = secret_or_var(env, "GMAIL_CLIENT_ID").ok()?;
++    let client_secret = secret_or_var(env, "GMAIL_CLIENT_SECRET").ok()?;
++
++    let form = format!(
++        "client_id={}&client_secret={}&refresh_token={}&grant_type=refresh_token",
++        pct(&client_id),
++        pct(&client_secret),
++        pct(refresh_token),
++    );
++
++    let headers = Headers::new();
++    let _ = headers.set("Content-Type", "application/x-www-form-urlencoded");
++
++    let mut init = RequestInit::new();
++    init.with_method(Method::Post)
++        .with_headers(headers)
++        .with_body(Some(form.into()));
++
++    let req = Request::new_with_init("https://oauth2.googleapis.com/token", &init).ok()?;
++    let mut resp = Fetch::Request(req).send().await.ok()?;
++    if resp.status_code() >= 300 {
++        return None;
++    }
++    let v: serde_json::Value = resp.json().await.ok()?;
++    v.get("access_token")
++        .and_then(|t| t.as_str())
++        .map(str::to_string)
++}
++
++/// Send one HTML email via the Gmail API. Returns true on success.
++async fn send_via_gmail(
++    env: &Env,
++    from: &str,
++    to: &str,
++    subject: &str,
++    html: &str,
++    refresh_token: &str,
++) -> bool {
++    let token = match mint_gmail_access_token(env, refresh_token).await {
++        Some(t) => t,
++        None => return false,
++    };
++
++    // RFC 2047 B-encode the subject so non-ASCII org names don't garble.
++    let enc_subject = format!("=?UTF-8?B?{}?=", STANDARD.encode(subject.as_bytes()));
++    let raw_message = format!(
++        "From: {from}\r\n\
++         To: {to}\r\n\
++         Subject: {enc_subject}\r\n\
++         MIME-Version: 1.0\r\n\
++         Content-Type: text/html; charset=\"UTF-8\"\r\n\
++         Content-Transfer-Encoding: 8bit\r\n\
++         \r\n\
++         {html}"
++    );
++    let raw = URL_SAFE_NO_PAD.encode(raw_message.as_bytes());
++    let body = serde_json::json!({ "raw": raw }).to_string();
++
++    let headers = Headers::new();
++    let _ = headers.set("Authorization", &format!("Bearer {token}"));
++    let _ = headers.set("Content-Type", "application/json");
++
++    let mut init = RequestInit::new();
++    init.with_method(Method::Post)
++        .with_headers(headers)
++        .with_body(Some(body.into()));
++
++    match Request::new_with_init(
++        "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
++        &init,
++    ) {
++        Ok(req) => match Fetch::Request(req).send().await {
++            Ok(resp) => resp.status_code() < 300,
++            Err(_) => false,
++        },
++        Err(_) => false,
++    }
++}
++
++/// Send one HTML email via a Resend-compatible JSON endpoint. No-op if unconfigured.
++async fn send_via_resend(env: &Env, from: &str, to: &str, subject: &str, html: &str) {
++    let url = match env.var("EMAIL_PROVIDER_URL") {
++        Ok(v) => v.to_string(),
++        Err(_) => return,
++    };
++    let api_key = match secret_or_var(env, "EMAIL_API_KEY") {
++        Ok(v) => v,
++        Err(_) => return,
++    };
++
 +    let body = serde_json::json!({
 +        "from": from,
 +        "to": [to],
