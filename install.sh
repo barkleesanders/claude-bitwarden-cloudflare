@@ -45,8 +45,8 @@ run "cp '$HERE/patches/0014_add_api_key.sql' '$WORKDIR/migrations/0014_add_api_k
 
 # ---- 2. Cloudflare resources ----
 say "Creating D1 database + KV namespace"
-run "cd '$WORKDIR' && wrangler d1 create vault1"
-run "cd '$WORKDIR' && wrangler kv namespace create ATTACHMENTS_KV"
+run "cd '$WORKDIR' && wrangler d1 create vault1 -c wrangler.toml"
+run "cd '$WORKDIR' && wrangler kv namespace create ATTACHMENTS_KV -c wrangler.toml"
 say "  → put the printed D1 database_id + KV id into wrangler.toml (the prompt/Claude does this automatically)"
 
 # ---- 3. web vault + toolchain + build ----
@@ -58,14 +58,14 @@ run "cd '$WORKDIR' && PATH=\"\$HOME/.cargo/bin:\$PATH\" rustup show >/dev/null &
 # ---- 4. config + secrets ----
 say "Setting BASE_URL + email-lock + JWT secrets"
 run "cd '$WORKDIR' && sed -i '' 's|# BASE_URL = .*|BASE_URL = \"https://$HOST\"|' wrangler.toml 2>/dev/null || true"
-run "cd '$WORKDIR' && printf '%s' '$EMAIL' | wrangler secret put ALLOWED_EMAILS"
-run "cd '$WORKDIR' && printf '%s' \"\$(openssl rand -base64 48)\" | wrangler secret put JWT_SECRET"
-run "cd '$WORKDIR' && printf '%s' \"\$(openssl rand -base64 48)\" | wrangler secret put JWT_REFRESH_SECRET"
+run "cd '$WORKDIR' && printf '%s' '$EMAIL' | wrangler secret put ALLOWED_EMAILS -c wrangler.toml"
+run "cd '$WORKDIR' && printf '%s' \"\$(openssl rand -base64 48)\" | wrangler secret put JWT_SECRET -c wrangler.toml"
+run "cd '$WORKDIR' && printf '%s' \"\$(openssl rand -base64 48)\" | wrangler secret put JWT_REFRESH_SECRET -c wrangler.toml"
 
 # ---- 5. schema + deploy ----
 say "Applying D1 schema + deploying the worker"
-run "cd '$WORKDIR' && wrangler d1 execute vault1 --file sql/schema.sql --remote --yes"
-run "cd '$WORKDIR' && wrangler deploy"
+run "cd '$WORKDIR' && wrangler d1 execute vault1 --file sql/schema.sql --remote --yes -c wrangler.toml"
+run "cd '$WORKDIR' && wrangler deploy -c wrangler.toml"
 
 # ---- 6. DNS + route (CF API if token present, else instructions) ----
 say "Attaching https://$HOST"

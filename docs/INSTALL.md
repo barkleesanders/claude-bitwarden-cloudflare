@@ -19,6 +19,12 @@ wrangler whoami       # confirm the right account
 
 You also need a **domain on that Cloudflare account** (so `vault.<domain>` can be proxied).
 
+> **⚠️ Gotcha — pin `-c wrangler.toml` on every mutating command.** wrangler walks *up* the
+> directory tree looking for a config. If you have a `wrangler.toml`/`wrangler.jsonc` anywhere in a
+> parent directory (e.g. `$HOME`), a bare `wrangler deploy` / `secret put` / `secret list` can
+> silently target the **wrong** worker and account. Always pass `-c wrangler.toml` (every command
+> below does). Verify the resolved worker first with `wrangler deploy --dry-run -c wrangler.toml`.
+
 ## 1. Clone + apply the API-key patch
 
 ```bash
@@ -34,8 +40,8 @@ cp ~/projects/claude-bitwarden-cloudflare/patches/0014_add_api_key.sql migration
 ## 2. Create the D1 database + KV namespace
 
 ```bash
-wrangler d1 create vault1
-wrangler kv namespace create ATTACHMENTS_KV
+wrangler d1 create vault1 -c wrangler.toml
+wrangler kv namespace create ATTACHMENTS_KV -c wrangler.toml
 ```
 
 Each command prints an id. **Paste them into `wrangler.toml`** — the `database_id` under
@@ -66,9 +72,9 @@ sed -i '' 's|# BASE_URL = .*|BASE_URL = "https://vault.example.com"|' wrangler.t
 # also set DISABLE_USER_REGISTRATION = "true" in wrangler.toml [vars] if you want
 # registration fully closed AFTER you create your own account.
 
-printf '%s' 'you@example.com'            | wrangler secret put ALLOWED_EMAILS
-printf '%s' "$(openssl rand -base64 48)" | wrangler secret put JWT_SECRET
-printf '%s' "$(openssl rand -base64 48)" | wrangler secret put JWT_REFRESH_SECRET
+printf '%s' 'you@example.com'            | wrangler secret put ALLOWED_EMAILS      -c wrangler.toml
+printf '%s' "$(openssl rand -base64 48)" | wrangler secret put JWT_SECRET          -c wrangler.toml
+printf '%s' "$(openssl rand -base64 48)" | wrangler secret put JWT_REFRESH_SECRET  -c wrangler.toml
 ```
 
 `ALLOWED_EMAILS` is the email-lock: the register endpoint stays public (Bitwarden clients call it),
@@ -77,8 +83,9 @@ but only addresses in this list are accepted. Everyone else gets `401`.
 ## 5. Apply the schema + deploy
 
 ```bash
-wrangler d1 execute vault1 --file sql/schema.sql --remote --yes
-wrangler deploy
+wrangler d1 execute vault1 --file sql/schema.sql --remote --yes -c wrangler.toml
+wrangler deploy --dry-run -c wrangler.toml   # confirm the resolved worker NAME is "warden-worker"
+wrangler deploy -c wrangler.toml
 ```
 
 ## 6. Attach `vault.example.com`
